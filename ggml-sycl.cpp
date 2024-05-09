@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <float.h>
 #include <limits>
 #include <stdint.h>
@@ -24,10 +25,9 @@
 #include <cmath>
 #include <iostream>
 #include <fstream>
-
 #include <stdio.h>
 #include <stdlib.h>
-
+#include <regex>
 
 #include <sycl/sycl.hpp>
 #include <sycl/half_type.hpp>
@@ -81,6 +81,30 @@ Following definition copied from DPCT head files, which are used by ggml-sycl.cp
 #else
 #define __dpct_noinline__ __attribute__((noinline))
 #endif
+
+
+std::string get_device_type_name(const sycl::device &Device) {
+    auto DeviceType = Device.get_info<sycl::info::device::device_type>();
+    switch (DeviceType) {
+    case sycl::info::device_type::cpu:
+        return "cpu";
+    case sycl::info::device_type::gpu:
+        return "gpu";
+    case sycl::info::device_type::host:
+        return "host";
+    case sycl::info::device_type::accelerator:
+        return "acc";
+    default:
+        return "unknown";
+    }
+}
+
+std::string get_device_backend_and_type(const sycl::device &device) {
+    std::stringstream device_type;
+    sycl::backend backend = device.get_backend();
+    device_type <<  backend << ":" << get_device_type_name(device);
+    return device_type.str();
+}
 
 namespace dpct
 {
@@ -202,24 +226,29 @@ namespace dpct
             // Version string has the following format:
             // a. OpenCL<space><major.minor><space><vendor-specific-information>
             // b. <major.minor>
+            // c. <AmdGcnArchName> e.g gfx1030
             std::string ver;
             ver = dev.get_info<sycl::info::device::version>();
             std::string::size_type i = 0;
-            while (i < ver.size())
-            {
-                if (isdigit(ver[i]))
-                    break;
-                i++;
+            while (i < ver.size()) {
+              if (isdigit(ver[i]))
+                break;
+              i++;
             }
             major = std::stoi(&(ver[i]));
-            while (i < ver.size())
-            {
-                if (ver[i] == '.')
-                    break;
-                i++;
+            while (i < ver.size()) {
+              if (ver[i] == '.')
+                break;
+              i++;
             }
-            i++;
-            minor = std::stoi(&(ver[i]));
+            if (i < ver.size()) {
+              // a. and b.
+              i++;
+              minor = std::stoi(&(ver[i]));
+            } else {
+              // c.
+              minor = 0;
+            }
         }
 
         template <typename tag, typename T>
@@ -711,11 +740,7 @@ namespace dpct
 
         sycl::queue &default_queue()
         {
-#ifdef DPCT_USM_LEVEL_NONE
-            return out_of_order_queue();
-#else
             return in_order_queue();
-#endif // DPCT_USM_LEVEL_NONE
         }
 
         void queues_wait_and_throw()
@@ -734,11 +759,7 @@ namespace dpct
 
         sycl::queue *create_queue(bool enable_exception_handler = false)
         {
-#ifdef DPCT_USM_LEVEL_NONE
-            return create_out_of_order_queue(enable_exception_handler);
-#else
             return create_in_order_queue(enable_exception_handler);
-#endif // DPCT_USM_LEVEL_NONE
         }
 
         sycl::queue *create_queue(sycl::context context, sycl::device device,
@@ -937,17 +958,67 @@ namespace dpct
 
     private:
         mutable std::recursive_mutex m_mutex;
+        static bool compare_dev(sycl::device &device1, sycl::device &device2)
+        {
+            dpct::device_info prop1;
+            dpct::get_device_info(prop1, device1);
+            dpct::device_info prop2;
+            dpct::get_device_info(prop2, device2);
+            return prop1.get_max_compute_units() > prop2.get_max_compute_units();
+        }
+        static int convert_backend_index(std::string & backend) {
+            if (backend == "ext_oneapi_level_zero:gpu") return 0;
+            if (backend == "opencl:gpu") return 1;
+            if (backend == "ext_oneapi_cuda:gpu") return 2;
+            if (backend == "ext_oneapi_hip:gpu") return 3;
+            if (backend == "opencl:cpu") return 4;
+            if (backend == "opencl:acc") return 5;
+            printf("convert_backend_index: can't handle backend=%s\n", backend.c_str());
+            GGML_ASSERT(false);
+        }
+        static bool compare_backend(std::string &backend1, std::string &backend2) {
+            return convert_backend_index(backend1) < convert_backend_index(backend2);
+        }
         dev_mgr()
         {
             sycl::device default_device =
                 sycl::device(sycl::default_selector_v);
             _devs.push_back(std::make_shared<device_ext>(default_device));
 
-            std::vector<sycl::device> sycl_all_devs =
-                sycl::device::get_devices(sycl::info::device_type::all);
+            std::vector<sycl::device> sycl_all_devs;
             // Collect other devices except for the default device.
             if (default_device.is_cpu())
                 _cpu_device = 0;
+
+            auto Platforms = sycl::platform::get_platforms();
+            // Keep track of the number of devices per backend
+            std::map<sycl::backend, size_t> DeviceNums;
+            std::map<std::string, std::vector<sycl::device>> backend_devices;
+
+            while (!Platforms.empty()) {
+                auto Platform = Platforms.back();
+                Platforms.pop_back();
+                auto devices = Platform.get_devices();
+                std::string backend_type = get_device_backend_and_type(devices[0]);
+                for (const auto &device : devices) {
+                    backend_devices[backend_type].push_back(device);
+                }
+            }
+
+            std::vector<std::string> keys;
+            for(auto it = backend_devices.begin(); it != backend_devices.end(); ++it) {
+                keys.push_back(it->first);
+            }
+            std::sort(keys.begin(), keys.end(), compare_backend);
+
+            for (auto &key : keys) {
+                std::vector<sycl::device> devs = backend_devices[key];
+                std::sort(devs.begin(), devs.end(), compare_dev);
+                for (const auto &dev : devs) {
+                    sycl_all_devs.push_back(dev);
+                }
+            }
+
             for (auto &dev : sycl_all_devs)
             {
                 if (dev == default_device)
@@ -996,11 +1067,6 @@ namespace dpct
         static pointer_access_attribute get_pointer_attribute(sycl::queue &q,
                                                               const void *ptr)
         {
-#ifdef DPCT_USM_LEVEL_NONE
-            return mem_mgr::instance().is_device_ptr(ptr)
-                       ? pointer_access_attribute::device_only
-                       : pointer_access_attribute::host_only;
-#else
             switch (sycl::get_pointer_type(ptr, q.get_context()))
             {
             case sycl::usm::alloc::unknown:
@@ -1011,7 +1077,6 @@ namespace dpct
             case sycl::usm::alloc::host:
                 return pointer_access_attribute::host_device;
             }
-#endif
         }
 
         template <typename ArgT>
@@ -1194,11 +1259,7 @@ namespace dpct
 
         static inline void *dpct_malloc(size_t size, sycl::queue &q)
         {
-#ifdef DPCT_USM_LEVEL_NONE
-            return mem_mgr::instance().mem_alloc(size * sizeof(byte_t));
-#else
             return sycl::malloc_device(size, q.get_device(), q.get_context());
-#endif // DPCT_USM_LEVEL_NONE
         }
 
 #define PITCH_DEFAULT_ALIGN(x) (((x) + 31) & ~(0x1F))
@@ -1222,25 +1283,7 @@ namespace dpct
         static inline sycl::event dpct_memset(sycl::queue &q, void *dev_ptr,
                                               valueT value, size_t size)
         {
-#ifdef DPCT_USM_LEVEL_NONE
-            auto &mm = mem_mgr::instance();
-            assert(mm.is_device_ptr(dev_ptr));
-            auto alloc = mm.translate_ptr(dev_ptr);
-            size_t offset = (valueT *)dev_ptr - (valueT *)alloc.alloc_ptr;
-
-            return q.submit([&](sycl::handler &cgh)
-                            {
-    auto r = sycl::range<1>(size);
-    auto o = sycl::id<1>(offset);
-    auto new_buffer = alloc.buffer.reinterpret<valueT>(
-        sycl::range<1>(alloc.size / sizeof(valueT)));
-    sycl::accessor<valueT, 1, sycl::access_mode::write,
-                sycl::access::target::device>
-        acc(new_buffer, cgh, r, o);
-    cgh.fill(acc, value); });
-#else
             return q.fill(dev_ptr, value, size);
-#endif // DPCT_USM_LEVEL_NONE
         }
 
         /**
@@ -1334,72 +1377,8 @@ namespace dpct
         {
             if (!size)
                 return sycl::event{};
-#ifdef DPCT_USM_LEVEL_NONE
-            auto &mm = mem_mgr::instance();
-            auto real_direction = deduce_memcpy_direction(q, to_ptr, from_ptr, direction);
-
-            switch (real_direction)
-            {
-            case host_to_host:
-                return q.submit([&](sycl::handler &cgh)
-                                {
-    cgh.depends_on(dep_events);
-    cgh.host_task([=] { std::memcpy(to_ptr, from_ptr, size); }); });
-            case host_to_device:
-            {
-                auto alloc = mm.translate_ptr(to_ptr);
-                size_t offset = (byte_t *)to_ptr - alloc.alloc_ptr;
-                return q.submit([&](sycl::handler &cgh)
-                                {
-    cgh.depends_on(dep_events);
-    auto r = sycl::range<1>(size);
-    auto o = sycl::id<1>(offset);
-    sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                        sycl::access::target::device>
-        acc(alloc.buffer, cgh, r, o);
-    cgh.copy(from_ptr, acc); });
-            }
-            case device_to_host:
-            {
-                auto alloc = mm.translate_ptr(from_ptr);
-                size_t offset = (byte_t *)from_ptr - alloc.alloc_ptr;
-                return q.submit([&](sycl::handler &cgh)
-                                {
-    cgh.depends_on(dep_events);
-    auto r = sycl::range<1>(size);
-    auto o = sycl::id<1>(offset);
-    sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                        sycl::access::target::device>
-        acc(alloc.buffer, cgh, r, o);
-    cgh.copy(acc, to_ptr); });
-            }
-            case device_to_device:
-            {
-                auto to_alloc = mm.translate_ptr(to_ptr);
-                auto from_alloc = mm.translate_ptr(from_ptr);
-                size_t to_offset = (byte_t *)to_ptr - to_alloc.alloc_ptr;
-                size_t from_offset = (byte_t *)from_ptr - from_alloc.alloc_ptr;
-                return q.submit([&](sycl::handler &cgh)
-                                {
-    cgh.depends_on(dep_events);
-    auto r = sycl::range<1>(size);
-    auto to_o = sycl::id<1>(to_offset);
-    auto from_o = sycl::id<1>(from_offset);
-    sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                        sycl::access::target::device>
-        to_acc(to_alloc.buffer, cgh, r, to_o);
-    sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                        sycl::access::target::device>
-        from_acc(from_alloc.buffer, cgh, r, from_o);
-    cgh.copy(from_acc, to_acc); });
-            }
-            default:
-                throw std::runtime_error("dpct_memcpy: invalid direction value");
-            }
-#else
             return q.memcpy(to_ptr, from_ptr, size, dep_events);
             GGML_UNUSED(direction);
-#endif // DPCT_USM_LEVEL_NONE
         }
 
         // Get actual copy range and make sure it will not exceed range.
@@ -1539,45 +1518,15 @@ namespace dpct
                 break;
             }
             case device_to_device:
-#ifdef DPCT_USM_LEVEL_NONE
-            {
-                auto &mm = mem_mgr::instance();
-                auto to_alloc = mm.translate_ptr(to_surface);
-                auto from_alloc = mm.translate_ptr(from_surface);
-                size_t to_offset = (byte_t *)to_surface - to_alloc.alloc_ptr;
-                size_t from_offset = (byte_t *)from_surface - from_alloc.alloc_ptr;
-                event_list.push_back(q.submit([&](sycl::handler &cgh)
-                                              {
-    cgh.depends_on(dep_events);
-    auto to_o = sycl::id<1>(to_offset);
-    auto from_o = sycl::id<1>(from_offset);
-    sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                        sycl::access::target::device>
-        to_acc(to_alloc.buffer, cgh,
-                get_copy_range(size, to_slice, to_range.get(0)), to_o);
-    sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                        sycl::access::target::device>
-        from_acc(from_alloc.buffer, cgh,
-                get_copy_range(size, from_slice, from_range.get(0)), from_o);
-    cgh.parallel_for<class dpct_memcpy_3d_detail_usmnone>(
-        size,
-        [=](sycl::id<3> id) {
-            to_acc[get_offset(id, to_slice, to_range.get(0))] =
-                from_acc[get_offset(id, from_slice, from_range.get(0))];
-        }); }));
-            }
-#else
-                event_list.push_back(q.submit([&](sycl::handler &cgh)
-                                              {
-    cgh.depends_on(dep_events);
-    cgh.parallel_for<class dpct_memcpy_3d_detail>(
-        size,
-        [=](sycl::id<3> id) {
-            to_surface[get_offset(id, to_slice, to_range.get(0))] =
-                from_surface[get_offset(id, from_slice, from_range.get(0))];
-        }); }));
-#endif
-            break;
+                event_list.push_back(q.submit([&](sycl::handler &cgh){
+                cgh.depends_on(dep_events);
+                cgh.parallel_for<class dpct_memcpy_3d_detail>(
+                    size,
+                    [=](sycl::id<3> id) {
+                        to_surface[get_offset(id, to_slice, to_range.get(0))] =
+                            from_surface[get_offset(id, from_slice, from_range.get(0))];
+                    }); }));
+                break;
             default:
                 throw std::runtime_error("dpct_memcpy: invalid direction value");
             }
@@ -1675,11 +1624,7 @@ namespace dpct
         {
             if (ptr)
             {
-#ifdef DPCT_USM_LEVEL_NONE
-                detail::mem_mgr::instance().mem_free(ptr);
-#else
                 sycl::free(ptr, q.get_context());
-#endif // DPCT_USM_LEVEL_NONE
             }
         }
 
@@ -1687,11 +1632,7 @@ namespace dpct
         inline auto get_memory(const void *x)
         {
             T *new_x = reinterpret_cast<T *>(const_cast<void *>(x));
-#ifdef DPCT_USM_LEVEL_NONE
-            return dpct::get_buffer<std::remove_cv_t<T>>(new_x);
-#else
             return new_x;
-#endif
         }
 
         template <typename T>
@@ -1723,24 +1664,6 @@ namespace dpct
                               const void *alpha, const void *a, int lda, const void *b,
                               int ldb, const void *beta, void *c, int ldc)
         {
-#ifndef __INTEL_MKL__
-            GGML_UNUSED(q);
-            GGML_UNUSED(a_trans);
-            GGML_UNUSED(b_trans);
-            GGML_UNUSED(m);
-            GGML_UNUSED(n);
-            GGML_UNUSED(k);
-            GGML_UNUSED(alpha);
-            GGML_UNUSED(a);
-            GGML_UNUSED(lda);
-            GGML_UNUSED(b);
-            GGML_UNUSED(ldb);
-            GGML_UNUSED(beta);
-            GGML_UNUSED(c);
-            GGML_UNUSED(ldc);
-            throw std::runtime_error("The oneAPI Math Kernel Library (oneMKL) Interfaces "
-                                     "Project does not support this API.");
-#else
             Ts alpha_value = dpct::get_value(reinterpret_cast<const Ts *>(alpha), q);
             Ts beta_value = dpct::get_value(reinterpret_cast<const Ts *>(beta), q);
             auto data_a = get_memory<const Ta>(a);
@@ -1749,7 +1672,6 @@ namespace dpct
             oneapi::mkl::blas::column_major::gemm(
                 q, a_trans, b_trans, m, n, k, alpha_value, data_a, lda,
                 data_b, ldb, beta_value, data_c, ldc);
-#endif
         }
 
         template <typename VecT, class BinaryOperation, class = void>
@@ -2143,72 +2065,8 @@ namespace dpct
     {
         if (!size)
             return sycl::event{};
-#ifdef DPCT_USM_LEVEL_NONE
-        auto &mm = mem_mgr::instance();
-        auto real_direction = deduce_memcpy_direction(q, to_ptr, from_ptr, direction);
-
-        switch (real_direction)
-        {
-        case host_to_host:
-            return q.submit([&](sycl::handler &cgh)
-                            {
-        cgh.depends_on(dep_events);
-        cgh.host_task([=] { std::memcpy(to_ptr, from_ptr, size); }); });
-        case host_to_device:
-        {
-            auto alloc = mm.translate_ptr(to_ptr);
-            size_t offset = (byte_t *)to_ptr - alloc.alloc_ptr;
-            return q.submit([&](sycl::handler &cgh)
-                            {
-        cgh.depends_on(dep_events);
-        auto r = sycl::range<1>(size);
-        auto o = sycl::id<1>(offset);
-        sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                            sycl::access::target::device>
-            acc(alloc.buffer, cgh, r, o);
-        cgh.copy(from_ptr, acc); });
-        }
-        case device_to_host:
-        {
-            auto alloc = mm.translate_ptr(from_ptr);
-            size_t offset = (byte_t *)from_ptr - alloc.alloc_ptr;
-            return q.submit([&](sycl::handler &cgh)
-                            {
-        cgh.depends_on(dep_events);
-        auto r = sycl::range<1>(size);
-        auto o = sycl::id<1>(offset);
-        sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                            sycl::access::target::device>
-            acc(alloc.buffer, cgh, r, o);
-        cgh.copy(acc, to_ptr); });
-        }
-        case device_to_device:
-        {
-            auto to_alloc = mm.translate_ptr(to_ptr);
-            auto from_alloc = mm.translate_ptr(from_ptr);
-            size_t to_offset = (byte_t *)to_ptr - to_alloc.alloc_ptr;
-            size_t from_offset = (byte_t *)from_ptr - from_alloc.alloc_ptr;
-            return q.submit([&](sycl::handler &cgh)
-                            {
-        cgh.depends_on(dep_events);
-        auto r = sycl::range<1>(size);
-        auto to_o = sycl::id<1>(to_offset);
-        auto from_o = sycl::id<1>(from_offset);
-        sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                            sycl::access::target::device>
-            to_acc(to_alloc.buffer, cgh, r, to_o);
-        sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                            sycl::access::target::device>
-            from_acc(from_alloc.buffer, cgh, r, from_o);
-        cgh.copy(from_acc, to_acc); });
-        }
-        default:
-            throw std::runtime_error("dpct_memcpy: invalid direction value");
-        }
-#else
         return q.memcpy(to_ptr, from_ptr, size, dep_events);
         GGML_UNUSED(direction);
-#endif // DPCT_USM_LEVEL_NONE
     }
 
     // Get actual copy range and make sure it will not exceed range.
@@ -2348,34 +2206,6 @@ namespace dpct
             break;
         }
         case device_to_device:
-#ifdef DPCT_USM_LEVEL_NONE
-        {
-            auto &mm = mem_mgr::instance();
-            auto to_alloc = mm.translate_ptr(to_surface);
-            auto from_alloc = mm.translate_ptr(from_surface);
-            size_t to_offset = (byte_t *)to_surface - to_alloc.alloc_ptr;
-            size_t from_offset = (byte_t *)from_surface - from_alloc.alloc_ptr;
-            event_list.push_back(q.submit([&](sycl::handler &cgh)
-                                          {
-        cgh.depends_on(dep_events);
-        auto to_o = sycl::id<1>(to_offset);
-        auto from_o = sycl::id<1>(from_offset);
-        sycl::accessor<byte_t, 1, sycl::access_mode::write,
-                            sycl::access::target::device>
-            to_acc(to_alloc.buffer, cgh,
-                    get_copy_range(size, to_slice, to_range.get(0)), to_o);
-        sycl::accessor<byte_t, 1, sycl::access_mode::read,
-                            sycl::access::target::device>
-            from_acc(from_alloc.buffer, cgh,
-                    get_copy_range(size, from_slice, from_range.get(0)), from_o);
-        cgh.parallel_for<class dpct_memcpy_3d_detail_usmnone>(
-            size,
-            [=](sycl::id<3> id) {
-                to_acc[get_offset(id, to_slice, to_range.get(0))] =
-                    from_acc[get_offset(id, from_slice, from_range.get(0))];
-            }); }));
-        }
-#else
             event_list.push_back(q.submit([&](sycl::handler &cgh)
                                           {
         cgh.depends_on(dep_events);
@@ -2385,7 +2215,6 @@ namespace dpct
                 to_surface[get_offset(id, to_slice, to_range.get(0))] =
                     from_surface[get_offset(id, from_slice, from_range.get(0))];
             }); }));
-#endif
         break;
         default:
             throw std::runtime_error("dpct_memcpy: invalid direction value");
@@ -2482,6 +2311,7 @@ namespace dpct
                                           lda, b, ldb, beta, c, ldc);
             break;
         }
+#ifdef __INTEL_MKL__
         case detail::get_type_combination_id(
             library_data_t::real_bfloat16, library_data_t::real_bfloat16,
             library_data_t::real_float, library_data_t::real_float):
@@ -2543,6 +2373,7 @@ namespace dpct
                 q, a_trans, b_trans, m, n, k, &alpha_float, a, lda, b, ldb, &beta_float, c, ldc);
             break;
         }
+#endif // __INTEL_MKL__
         default:
             throw std::runtime_error("the combination of data type is unsupported");
         }
@@ -2576,9 +2407,6 @@ namespace dpct
                            void *c[], library_data_t c_type, int ldc,
                            int batch_size, library_data_t scaling_type)
     {
-#ifdef DPCT_USM_LEVEL_NONE
-        throw std::runtime_error("this API is unsupported when USM level is none");
-#else
         if (scaling_type == library_data_t::real_float &&
             c_type == library_data_t::complex_float)
         {
@@ -2713,7 +2541,6 @@ namespace dpct
         default:
             throw std::runtime_error("the combination of data type is unsupported");
         }
-#endif
     }
 
     /// Computes a batch of matrix-matrix product with general matrices.
@@ -2894,11 +2721,237 @@ namespace dpct
     using err0 = detail::generic_error_type<struct err0_tag, int>;
     using err1 = detail::generic_error_type<struct err1_tag, int>;
 
+    static inline void dpct_free(void *ptr, sycl::queue &q = get_default_queue()) {
+        detail::dpct_free(ptr, q);
+    }
+
+    /// dpct accessor used as device function parameter.
+    template <class T, memory_region Memory, size_t Dimension> class accessor;
+    template <class T, memory_region Memory> class accessor<T, Memory, 3> {
+    public:
+        using memory_t = detail::memory_traits<Memory, T>;
+        using element_t = typename memory_t::element_t;
+        using pointer_t = typename memory_t::pointer_t;
+        using accessor_t = typename memory_t::template accessor_t<3>;
+        accessor(pointer_t data, const sycl::range<3> &in_range)
+            : _data(data), _range(in_range) {}
+        template <memory_region M = Memory>
+        accessor(typename std::enable_if<M != local, const accessor_t>::type &acc)
+            : accessor(acc, acc.get_range()) {}
+        accessor(const accessor_t &acc, const sycl::range<3> &in_range)
+            : accessor(acc.get_pointer(), in_range) {}
+        accessor<T, Memory, 2> operator[](size_t index) const {
+            sycl::range<2> sub(_range.get(1), _range.get(2));
+            return accessor<T, Memory, 2>(_data + index * sub.size(), sub);
+        }
+
+        pointer_t get_ptr() const { return _data; }
+
+    private:
+        pointer_t _data;
+        sycl::range<3> _range;
+    };
+    template <class T, memory_region Memory> class accessor<T, Memory, 2> {
+    public:
+        using memory_t = detail::memory_traits<Memory, T>;
+        using element_t = typename memory_t::element_t;
+        using pointer_t = typename memory_t::pointer_t;
+        using accessor_t = typename memory_t::template accessor_t<2>;
+        accessor(pointer_t data, const sycl::range<2> &in_range)
+            : _data(data), _range(in_range) {}
+        template <memory_region M = Memory>
+        accessor(typename std::enable_if<M != local, const accessor_t>::type &acc)
+            : accessor(acc, acc.get_range()) {}
+        accessor(const accessor_t &acc, const sycl::range<2> &in_range)
+            : accessor(acc.get_pointer(), in_range) {}
+
+        pointer_t operator[](size_t index) const {
+            return _data + _range.get(1) * index;
+        }
+
+        pointer_t get_ptr() const { return _data; }
+
+    private:
+        pointer_t _data;
+        sycl::range<2> _range;
+    };
+
+    namespace detail {
+        /// Device variable with address space of shared, global or constant.
+        template <class T, memory_region Memory, size_t Dimension> class device_memory {
+        public:
+            using accessor_t =
+                typename detail::memory_traits<Memory,
+                                            T>::template accessor_t<Dimension>;
+            using value_t = typename detail::memory_traits<Memory, T>::value_t;
+            using dpct_accessor_t = dpct::accessor<T, Memory, Dimension>;
+
+            device_memory() : device_memory(sycl::range<Dimension>(1)) {}
+
+            /// Constructor of 1-D array with initializer list
+            device_memory(const sycl::range<Dimension> &in_range,
+                        std::initializer_list<value_t> &&init_list)
+                : device_memory(in_range) {
+                assert(init_list.size() <= in_range.size());
+                _host_ptr = (value_t *)std::malloc(_size);
+                std::memset(_host_ptr, 0, _size);
+                std::memcpy(_host_ptr, init_list.begin(), init_list.size() * sizeof(T));
+            }
+
+            /// Constructor of 2-D array with initializer list
+            template <size_t D = Dimension>
+            device_memory(
+                const typename std::enable_if<D == 2, sycl::range<2>>::type &in_range,
+                std::initializer_list<std::initializer_list<value_t>> &&init_list)
+                : device_memory(in_range) {
+                assert(init_list.size() <= in_range[0]);
+                _host_ptr = (value_t *)std::malloc(_size);
+                std::memset(_host_ptr, 0, _size);
+                auto tmp_data = _host_ptr;
+                for (auto sub_list : init_list) {
+                    assert(sub_list.size() <= in_range[1]);
+                    std::memcpy(tmp_data, sub_list.begin(),
+                                sub_list.size() * sizeof(T));
+                    tmp_data += in_range[1];
+                }
+            }
+
+            /// Constructor with range
+            device_memory(const sycl::range<Dimension> &range_in)
+                : _size(range_in.size() * sizeof(T)), _range(range_in),
+                _reference(false), _host_ptr(nullptr), _device_ptr(nullptr) {
+                static_assert(
+                    (Memory == global) || (Memory == constant) || (Memory == shared),
+                    "device memory region should be global, constant or shared");
+                // Make sure that singleton class mem_mgr and dev_mgr will destruct
+                // later than this.
+                detail::mem_mgr::instance();
+                dev_mgr::instance();
+            }
+
+            /// Constructor with range
+            template <class... Args>
+            device_memory(Args... Arguments)
+                : device_memory(sycl::range<Dimension>(Arguments...)) {}
+
+            ~device_memory() {
+                if (_device_ptr && !_reference)
+                    dpct::dpct_free(_device_ptr);
+                if (_host_ptr)
+                    std::free(_host_ptr);
+            }
+
+            /// Allocate memory with default queue, and init memory if has initial
+            /// value.
+            void init() { init(dpct::get_default_queue()); }
+            /// Allocate memory with specified queue, and init memory if has initial
+            /// value.
+            void init(sycl::queue &q) {
+                if (_device_ptr)
+                    return;
+                if (!_size)
+                    return;
+                allocate_device(q);
+                if (_host_ptr)
+                    detail::dpct_memcpy(q, _device_ptr, _host_ptr, _size,
+                                        host_to_device);
+            }
+
+            /// The variable is assigned to a device pointer.
+            void assign(value_t *src, size_t size) {
+                this->~device_memory();
+                new (this) device_memory(src, size);
+            }
+
+            /// Get memory pointer of the memory object, which is virtual pointer when
+            /// usm is not used, and device pointer when usm is used.
+            value_t *get_ptr() { return get_ptr(get_default_queue()); }
+            /// Get memory pointer of the memory object, which is virtual pointer when
+            /// usm is not used, and device pointer when usm is used.
+            value_t *get_ptr(sycl::queue &q) {
+                init(q);
+                return _device_ptr;
+            }
+
+            /// Get the device memory object size in bytes.
+            size_t get_size() { return _size; }
+
+            template <size_t D = Dimension>
+            typename std::enable_if<D == 1, T>::type &operator[](size_t index) {
+                init();
+                return _device_ptr[index];
+            }
+
+            /// Get dpct::accessor with dimension info for the device memory object
+            /// when usm is used and dimension is greater than 1.
+            template <size_t D = Dimension>
+            typename std::enable_if<D != 1, dpct_accessor_t>::type
+            get_access(sycl::handler &cgh) {
+                return dpct_accessor_t((T *)_device_ptr, _range);
+            }
+
+        private:
+            device_memory(value_t *memory_ptr, size_t size)
+                : _size(size), _range(size / sizeof(T)), _reference(true),
+                _device_ptr(memory_ptr) {}
+
+            void allocate_device(sycl::queue &q) {
+        #ifndef DPCT_USM_LEVEL_NONE
+                if (Memory == shared) {
+                    _device_ptr = (value_t *)sycl::malloc_shared(_size, q.get_device(),
+                                                                q.get_context());
+                    return;
+                }
+        #ifdef SYCL_EXT_ONEAPI_USM_DEVICE_READ_ONLY
+                if (Memory == constant) {
+                    _device_ptr = (value_t *)sycl::malloc_device(
+                        _size, q.get_device(), q.get_context(),
+                        sycl::ext::oneapi::property::usm::device_read_only());
+                    return;
+                }
+        #endif
+        #endif
+                _device_ptr = (value_t *)detail::dpct_malloc(_size, q);
+            }
+
+            size_t _size;
+            sycl::range<Dimension> _range;
+            bool _reference;
+            value_t *_host_ptr;
+            value_t *_device_ptr;
+        };
+        template <class T, memory_region Memory>
+        class device_memory<T, Memory, 0> : public device_memory<T, Memory, 1> {
+        public:
+            using base = device_memory<T, Memory, 1>;
+            using value_t = typename base::value_t;
+            using accessor_t =
+                typename detail::memory_traits<Memory, T>::template accessor_t<0>;
+
+            /// Constructor with initial value.
+            device_memory(const value_t &val) : base(sycl::range<1>(1), {val}) {}
+
+            /// Default constructor
+            device_memory() : base(1) {}
+        };
+        } // namespace detail
+
+    template <class T, size_t Dimension>
+    using global_memory = detail::device_memory<T, global, Dimension>;
+    template <class T, size_t Dimension>
+    using constant_memory = detail::device_memory<T, constant, Dimension>;
+    template <class T, size_t Dimension>
+    using shared_memory = detail::device_memory<T, shared, Dimension>;
+
+
 } // COPY from DPCT head files
 
+#define GGML_COMMON_DECL_SYCL
+#define GGML_COMMON_IMPL_SYCL
+#include "ggml-common.h"
 
 static int g_ggml_sycl_debug=0;
-#define GGML_SYCL_DEBUG(...) do{if(g_ggml_sycl_debug) printf(__VA_ARGS__);}while(0)
+#define GGML_SYCL_DEBUG(...) do{if(g_ggml_sycl_debug) fprintf(stderr, __VA_ARGS__);}while(0)
 
 #define CHECK_TRY_ERROR(expr)                                                  \
   [&]() {                                                                      \
@@ -2938,6 +2991,20 @@ static int g_work_group_size = 0;
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
+// dmmv = dequantize_mul_mat_vec
+#ifndef GGML_SYCL_DMMV_X
+#define GGML_SYCL_DMMV_X 32
+#endif
+#ifndef GGML_SYCL_MMV_Y
+#define GGML_SYCL_MMV_Y 1
+#endif
+
+enum ggml_sycl_backend_gpu_mode {
+    SYCL_UNSET_GPU_MODE = -1,
+    SYCL_SINGLE_GPU_MODE = 0,
+    SYCL_MUL_GPU_MODE
+};
+
 static_assert(sizeof(sycl::half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
 static void crash(){
@@ -2970,6 +3037,10 @@ typedef sycl::half2 dfloat2;
 typedef float dfloat; // dequantize float
 typedef sycl::float2 dfloat2;
 #endif //GGML_SYCL_F16
+
+#define MMVQ_MAX_BATCH_SIZE  8
+
+static const int8_t kvalues_iq4nl[16]={-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
 bool   ggml_sycl_loaded(void);
 void * ggml_sycl_host_malloc(size_t size);
@@ -3053,66 +3124,6 @@ typedef void (*ggml_sycl_op_flatten_t)(const ggml_tensor *src0,
                                        const float *src1_dd, float *dst_dd,
                                        const dpct::queue_ptr &main_stream);
 
-// QK = number of values after dequantization
-// QR = QK / number of values before dequantization
-// QI = number of 32 bit integers before dequantization
-
-#define QK4_0 32
-#define QR4_0 2
-#define QI4_0 (QK4_0 / (4 * QR4_0))
-typedef struct dpct_type_471834 {
-    sycl::half d;           // delta
-    uint8_t qs[QK4_0 / 2];  // nibbles / quants
-} block_q4_0;
-static_assert(sizeof(block_q4_0) == sizeof(ggml_fp16_t) + QK4_0 / 2, "wrong q4_0 block size/padding");
-
-#define QK4_1 32
-#define QR4_1 2
-#define QI4_1 (QK4_1 / (4 * QR4_1))
-typedef struct dpct_type_143705 {
-    sycl::half2 dm;         // dm.x = delta, dm.y = min
-    uint8_t qs[QK4_1 / 2];  // nibbles / quants
-} block_q4_1;
-static_assert(sizeof(block_q4_1) == sizeof(ggml_fp16_t) * 2 + QK4_1 / 2, "wrong q4_1 block size/padding");
-
-#define QK5_0 32
-#define QR5_0 2
-#define QI5_0 (QK5_0 / (4 * QR5_0))
-typedef struct dpct_type_673649 {
-    sycl::half d;           // delta
-    uint8_t qh[4];          // 5-th bit of quants
-    uint8_t qs[QK5_0 / 2];  // nibbles / quants
-} block_q5_0;
-static_assert(sizeof(block_q5_0) == sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK5_0 / 2, "wrong q5_0 block size/padding");
-
-#define QK5_1 32
-#define QR5_1 2
-#define QI5_1 (QK5_1 / (4 * QR5_1))
-typedef struct dpct_type_135589 {
-    sycl::half2 dm;         // dm.x = delta, dm.y = min
-    uint8_t qh[4];          // 5-th bit of quants
-    uint8_t qs[QK5_1 / 2];  // nibbles / quants
-} block_q5_1;
-static_assert(sizeof(block_q5_1) == 2 * sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK5_1 / 2, "wrong q5_1 block size/padding");
-
-#define QK8_0 32
-#define QR8_0 1
-#define QI8_0 (QK8_0 / (4 * QR8_0))
-typedef struct dpct_type_122878 {
-    sycl::half d;           // delta
-    int8_t  qs[QK8_0];      // quants
-} block_q8_0;
-static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong q8_0 block size/padding");
-
-#define QK8_1 32
-#define QR8_1 1
-#define QI8_1 (QK8_1 / (4 * QR8_1))
-typedef struct dpct_type_143721 {
-    sycl::half2 ds;         // ds.x = delta, ds.y = sum
-    int8_t  qs[QK8_0];      // quants
-} block_q8_1;
-static_assert(sizeof(block_q8_1) == 2*sizeof(ggml_fp16_t) + QK8_0, "wrong q8_1 block size/padding");
-
 typedef float (*vec_dot_q_sycl_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & iqs);
 typedef void (*allocate_tiles_sycl_t)(int **x_ql, sycl::half2 **x_dm,
                                       int **x_qh, int **x_sc);
@@ -3129,87 +3140,6 @@ typedef float (*vec_dot_q_mul_mat_sycl_t)(
     const int *__restrict__ y_qs, const sycl::half2 *__restrict__ y_ms,
     const int &i, const int &j, const int &k);
 
-//================================= k-quants
-
-#ifdef GGML_QKK_64
-#define QK_K 64
-#define K_SCALE_SIZE 4
-#else
-#define QK_K 256
-#define K_SCALE_SIZE 12
-#endif
-
-#define QR2_K 4
-#define QI2_K (QK_K / (4*QR2_K))
-typedef struct dpct_type_619598 {
-    uint8_t scales[QK_K/16]; // scales and mins, quantized with 4 bits
-    uint8_t qs[QK_K/4];      // quants
-    sycl::half2 dm;          // super-block scale for quantized scales/mins
-} block_q2_K;
-static_assert(sizeof(block_q2_K) == 2*sizeof(ggml_fp16_t) + QK_K/16 + QK_K/4, "wrong q2_K block size/padding");
-
-#define QR3_K 4
-#define QI3_K (QK_K / (4*QR3_K))
-typedef struct dpct_type_138576 {
-    uint8_t hmask[QK_K/8];     // quants - high bit
-    uint8_t qs[QK_K/4];        // quants - low 2 bits
-#ifdef GGML_QKK_64
-    uint8_t scales[2]; // scales, quantized with 8 bits
-#else
-    uint8_t scales[K_SCALE_SIZE]; // scales, quantized with 6 bits
-#endif
-    sycl::half d; // super-block scale
-} block_q3_K;
-//static_assert(sizeof(block_q3_K) == sizeof(ggml_fp16_t) + QK_K / 4 + QK_K / 8 + K_SCALE_SIZE, "wrong q3_K block size/padding");
-
-#define QR4_K 2
-#define QI4_K (QK_K / (4*QR4_K))
-#ifdef GGML_QKK_64
-typedef struct {
-    half    dm[2];             // super-block scales/mins
-    uint8_t scales[2];         // 4-bit block scales/mins
-    uint8_t qs[QK_K/2];        // 4--bit quants
-} block_q4_K;
-static_assert(sizeof(block_q4_K) == sizeof(half2) + QK_K/2 + 2, "wrong q4_K block size/padding");
-#else
-typedef struct dpct_type_154943 {
-    sycl::half2 dm;            // super-block scale for quantized scales/mins
-    uint8_t scales[3*QK_K/64]; // scales, quantized with 6 bits
-    uint8_t qs[QK_K/2];        // 4--bit quants
-} block_q4_K;
-static_assert(sizeof(block_q4_K) == 2*sizeof(ggml_fp16_t) + 3*QK_K/64 + QK_K/2, "wrong q4_K block size/padding");
-#endif
-
-#define QR5_K 2
-#define QI5_K (QK_K / (4*QR5_K))
-#ifdef GGML_QKK_64
-typedef struct {
-    half d;                  // super-block scale
-    int8_t scales[QK_K/16];  // block scales
-    uint8_t qh[QK_K/8];      // quants, high bit
-    uint8_t qs[QK_K/2];      // quants, low 4 bits
-} block_q5_K;
-static_assert(sizeof(block_q5_K) == sizeof(ggml_fp16_t) + QK_K/2 + QK_K/8 + QK_K/16, "wrong q5_K block size/padding");
-#else
-typedef struct dpct_type_866817 {
-    sycl::half2 dm;               // super-block scale for quantized scales/mins
-    uint8_t scales[K_SCALE_SIZE]; // scales and mins, quantized with 6 bits
-    uint8_t qh[QK_K/8];           // quants, high bit
-    uint8_t qs[QK_K/2];           // quants, low 4 bits
-} block_q5_K;
-static_assert(sizeof(block_q5_K) == 2*sizeof(ggml_fp16_t) + K_SCALE_SIZE + QK_K/2 + QK_K/8, "wrong q5_K block size/padding");
-#endif
-
-#define QR6_K 2
-#define QI6_K (QK_K / (4*QR6_K))
-typedef struct dpct_type_107281 {
-    uint8_t ql[QK_K/2];   // quants, lower 4 bits
-    uint8_t qh[QK_K/4];   // quants, upper 2 bits
-    int8_t  scales[QK_K/16]; // scales
-    sycl::half d;            // delta
-} block_q6_K;
-static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_K block size/padding");
-
 #define WARP_SIZE 32
 #define MATRIX_ROW_PADDING 512 // last row of quant. matrices is a multiple of this to avoid out-of-bounds memory accesses
 
@@ -3224,7 +3154,6 @@ static_assert(sizeof(block_q6_K) == sizeof(ggml_fp16_t) + 13*QK_K/16, "wrong q6_
 #define SYCL_SCALE_BLOCK_SIZE 256
 #define SYCL_CLAMP_BLOCK_SIZE 256
 #define SYCL_ROPE_BLOCK_SIZE 256
-#define SYCL_SOFT_MAX_BLOCK_SIZE 1024
 #define SYCL_ALIBI_BLOCK_SIZE 32
 #define SYCL_DIAG_MASK_INF_BLOCK_SIZE 32
 #define SYCL_QUANTIZE_BLOCK_SIZE 256
@@ -3277,8 +3206,27 @@ class sycl_gpu_mgr {
         int work_group_size = 0;
         std::string gpus_list = "";
 
+        /*
+        Use all GPUs with same top max compute units
+        */
         sycl_gpu_mgr() {
             detect_sycl_gpu_list_with_max_cu();
+            get_allow_gpus();
+            create_context_with_gpus();
+        }
+
+        /*
+        Only use the assigned GPU
+        */
+        sycl_gpu_mgr(int main_gpu_id) {
+            sycl::device device = dpct::dev_mgr::instance().get_device(main_gpu_id);
+            dpct::device_info prop;
+            dpct::get_device_info(prop, device);
+            gpus.push_back(main_gpu_id);
+            devices.push_back(device);
+            work_group_size = prop.get_max_work_group_size();
+            max_compute_units = prop.get_max_compute_units();
+
             get_allow_gpus();
             create_context_with_gpus();
         }
@@ -3298,7 +3246,7 @@ class sycl_gpu_mgr {
                 gpus_list += std::to_string(gpus[i]);
                 gpus_list += ",";
             }
-            if (gpus_list.length() > 2) {
+            if (gpus_list.length() > 1) {
                 gpus_list.pop_back();
             }
         }
@@ -3327,7 +3275,7 @@ class sycl_gpu_mgr {
                 dpct::device_info prop;
                 dpct::get_device_info(prop, device);
                 if (max_compute_units == prop.get_max_compute_units() &&
-                    prop.get_major_version() == 1) {
+                    is_ext_oneapi_device(device)) {
                     gpus.push_back(id);
                     devices.push_back(device);
                     work_group_size = prop.get_max_work_group_size();
@@ -3347,8 +3295,8 @@ class sycl_gpu_mgr {
                 if (gpus[i] == id)
                     return i;
             }
-            assert(false);
-            return -1;
+            printf("miss to get device index by id=%d\n", id);
+            GGML_ASSERT(false);
         }
 
         int get_next_index(int id) {
@@ -3357,8 +3305,16 @@ class sycl_gpu_mgr {
                 if (gpus[i] == id)
                     return i;
             }
-            assert(false);
-            return -1;
+            GGML_ASSERT(false);
+        }
+
+        bool is_ext_oneapi_device(const sycl::device &dev) {
+            sycl::backend dev_backend = dev.get_backend();
+            if (dev_backend == sycl::backend::ext_oneapi_level_zero ||
+                dev_backend == sycl::backend::ext_oneapi_cuda ||
+                dev_backend == sycl::backend::ext_oneapi_hip)
+                return true;
+            return false;
         }
 };
 
@@ -3367,10 +3323,13 @@ static int g_device_count = -1;
 static int g_all_sycl_device_count = -1;
 static int g_main_device = -1;
 static int g_main_device_id = -1;
+static bool g_ggml_backend_sycl_buffer_type_initialized = false;
 
 static std::array<float, GGML_SYCL_MAX_DEVICES> g_default_tensor_split = {};
 
 static float g_tensor_split[GGML_SYCL_MAX_DEVICES] = {0};
+
+static ggml_sycl_backend_gpu_mode g_ggml_sycl_backend_gpu_mode = SYCL_UNSET_GPU_MODE;
 
 struct sycl_device_capabilities {
     int     cc;                 // compute capability
@@ -3478,7 +3437,7 @@ void log_ggml_var_device(const char*name, float *src, size_t total_elements, boo
         local_buf = (float *) ggml_sycl_host_malloc(total_size);
         ggml_sycl_set_device(g_main_device);
         dpct::queue_ptr main_stream = g_syclStreams[g_main_device][0];
-        main_stream->memcpy(local_buf, src, total_size);
+        main_stream->memcpy(local_buf, src, total_size).wait();
     }
     else {
         local_buf = (float *)src;
@@ -3487,8 +3446,42 @@ void log_ggml_var_device(const char*name, float *src, size_t total_elements, boo
     std::ofstream logfile;
     logfile.open(filename);
     for(size_t i=0; i<total_elements; i++){
+        logfile << local_buf[i] <<" ";
         if((i+1)%20 ==0) logfile <<std::endl;
-        else logfile << local_buf[i] <<" ";
+    }
+    logfile <<std::endl;
+    logfile.close();
+
+    if(src_on_device) ggml_sycl_host_free(local_buf);
+}
+
+void log_ggml_var_device_fp16(const char*name, sycl::half *src, size_t total_elements, bool src_on_device){
+    if(!g_ggml_sycl_debug) return;
+    if(!src){
+        printf("GGML Tensor:%s skip to save for NULL pointer\n", name);
+        return;
+    }
+    char filename[1024];
+    sprintf(filename, "%s.txt", name);
+    printf("GGML Tensor:%s save to %s\n", name, filename);
+
+    size_t total_size = total_elements*sizeof(sycl::half);
+    sycl::half *local_buf = NULL;
+    if(src_on_device) {
+        local_buf = (sycl::half *) ggml_sycl_host_malloc(total_size);
+        ggml_sycl_set_device(g_main_device);
+        dpct::queue_ptr main_stream = g_syclStreams[g_main_device][0];
+        main_stream->memcpy(local_buf, src, total_size).wait();
+    }
+    else {
+        local_buf = (sycl::half *)src;
+    }
+
+    std::ofstream logfile;
+    logfile.open(filename);
+    for(size_t i=0; i<total_elements; i++){
+        logfile << local_buf[i] <<" ";
+        if((i+1)%20 ==0) logfile <<std::endl;
     }
     logfile <<std::endl;
     logfile.close();
@@ -4129,6 +4122,66 @@ static __dpct_inline__ void dequantize_q8_0(const void *vx, const int ib,
 #endif // GGML_SYCL_F16
 }
 
+template<typename dst_t>
+static void dequantize_block_q4_0(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32,
+                                  const sycl::nd_item<3> &item_ct1) {
+
+    const int i = item_ct1.get_group(2);
+
+    // assume 32 threads
+    const int tid = item_ct1.get_local_id(2);
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+
+    const block_q4_0 * x = (const block_q4_0 *)vx + ib;
+    const float d = sycl::vec<sycl::half, 1>(x->d)
+                        .convert<float, sycl::rounding_mode::automatic>()[0];
+    const float dm = -8*d;
+
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int l = 0; l < 4; ++l) {
+        y[l+ 0] = d * (q[l] & 0xF) + dm;
+        y[l+16] = d * (q[l] >>  4) + dm;
+    }
+}
+
+template<typename dst_t>
+static void dequantize_block_q4_1(const void * __restrict__ vx, dst_t * __restrict__ yy, int nb32,
+                                  const sycl::nd_item<3> &item_ct1) {
+
+    const int i = item_ct1.get_group(2);
+
+    // assume 32 threads
+    const int tid = item_ct1.get_local_id(2);
+    const int il  = tid/8;
+    const int ir  = tid%8;
+    const int ib = 8*i + ir;
+    if (ib >= nb32) {
+        return;
+    }
+
+    dst_t * y = yy + 256*i + 32*ir + 4*il;
+
+    const block_q4_1 * x = (const block_q4_1 *)vx + ib;
+    const sycl::float2 d =
+        x->dm.convert<float, sycl::rounding_mode::automatic>();
+
+    const uint8_t * q = x->qs + 4*il;
+
+    for (int l = 0; l < 4; ++l) {
+        y[l + 0] = d.x() * (q[l] & 0xF) + d.y();
+        y[l + 16] = d.x() * (q[l] >> 4) + d.y();
+    }
+}
+
+
 //================================== k-quants
 
 template<typename dst_t>
@@ -4158,8 +4211,9 @@ static void dequantize_block_q2_K(const void * __restrict__ vx, dst_t * __restri
     const int il = tid%16;  // 0...15
     const uint8_t q = x[i].qs[il] >> (2*is);
     dst_t * y = yy + i*QK_K + 16*is + il;
-    float dall = __low2half(x[i].dm);
-    float dmin = __high2half(x[i].dm);
+
+    float dall = x[i].dm[0];
+    float dmin = x[i].dm[1];
     y[ 0] = dall * (x[i].scales[is+0] & 0xF) * ((q >> 0) & 3) - dmin * (x[i].scales[is+0] >> 4);
     y[32] = dall * (x[i].scales[is+2] & 0xF) * ((q >> 4) & 3) - dmin * (x[i].scales[is+2] >> 4);
 #endif
@@ -4198,7 +4252,7 @@ static void dequantize_block_q3_K(const void * __restrict__ vx, dst_t * __restri
 
     for (int l = l0; l < l0+4; ++l) y[l] = dl * ((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
 #else
-    const int tid = threadIdx.x;
+    const int tid = item_ct1.get_local_id(2);
     const int is  = tid/16;  // 0 or 1
     const int il  = tid%16;  // 0...15
     const int im  = il/8;    // 0...1
@@ -4264,7 +4318,7 @@ static void dequantize_block_q4_K(const void * __restrict__ vx, dst_t * __restri
         y[l +32] = d2 * (q[l] >>  4) - m2;
     }
 #else
-    const int tid = threadIdx.x;
+    const int tid = item_ct1.get_local_id(2);
     const uint8_t * q = x[i].qs;
     dst_t * y = yy + i*QK_K;
     const float d = (float)x[i].dm[0];
@@ -4309,7 +4363,7 @@ static void dequantize_block_q5_K(const void * __restrict__ vx, dst_t * __restri
     y[32] = d2 * ((ql[ 0] >>  4) + (qh[ 0] & hm ? 16 : 0)) - m2;
     y[33] = d2 * ((ql[ 1] >>  4) + (qh[ 1] & hm ? 16 : 0)) - m2;
 #else
-    const int tid = threadIdx.x;
+    const int tid = item_ct1.get_local_id(2);
     const uint8_t q = x[i].qs[tid];
     const int im = tid/8;  // 0...3
     const int in = tid%8;  // 0...7
@@ -4351,7 +4405,7 @@ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restri
 #else
 
     // assume 32 threads
-    const int tid = threadIdx.x;
+    const int tid = item_ct1.get_local_id(2);
     const int ip  = tid/16;         // 0 or 1
     const int il  = tid - 16*ip;    // 0...15
 
@@ -4367,6 +4421,257 @@ static void dequantize_block_q6_K(const void * __restrict__ vx, dst_t * __restri
     y[32] = d * sc[ip+2] * ((int8_t)((ql  >> 4) | (((qh >> 4) & 3) << 4)) - 32);
 #endif
 }
+
+template<typename dst_t>
+static void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                     const sycl::nd_item<3> &item_ct1,
+                                     const uint64_t *iq2xxs_grid_ptr,
+                                     const uint8_t *ksigns_iq2xs_ptr,
+                                     const uint8_t *kmask_iq2xs_ptr) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq2_xxs * x = (const block_iq2_xxs  *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * q2 = x[i].qs + 4*ib;
+    const uint8_t  * aux8 = (const uint8_t *)q2;
+    const uint8_t  * grid = (const uint8_t *)(iq2xxs_grid_ptr + aux8[il]);
+    const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    const float d = (float)x[i].d * (0.5f + (aux32 >> 28)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs_ptr[(aux32 >> 7*il) & 127];
+    for (int j = 0; j < 8; ++j) y[j] = d * grid[j] * (signs & kmask_iq2xs_ptr[j] ? -1.f : 1.f);
+#else
+    assert(false);
+#endif
+
+}
+
+template<typename dst_t>
+static void dequantize_block_iq2_xs(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                    const sycl::nd_item<3> &item_ct1,
+                                    const uint64_t *iq2xs_grid,
+                                    const uint8_t *ksigns_iq2xs,
+                                    const uint8_t *kmask_iq2xs) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq2_xs * x = (const block_iq2_xs *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * q2 = x[i].qs + 4*ib;
+    const uint8_t  * grid = (const uint8_t *)(iq2xs_grid + (q2[il] & 511));
+    const float d = (float)x[i].d * (0.5f + ((x[i].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    const uint8_t signs = ksigns_iq2xs[q2[il] >> 9];
+    for (int j = 0; j < 8; ++j) y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+    assert(false);
+#endif
+
+}
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq2_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                       const sycl::nd_item<3> &item_ct1) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq2_s * x = (const block_iq2_s *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t * grid = (const uint8_t *)(iq2s_grid + (x[i].qs[4*ib+il] | ((x[i].qh[ib] << (8-2*il)) & 0x300)));
+    const float d = (float)x[i].d * (0.5f + ((x[i].scales[ib] >> 4*(il/2)) & 0xf)) * 0.25f;
+    const uint8_t signs = x[i].qs[QK_K/8+4*ib+il];
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        y[j] = d * grid[j] * (signs & kmask_iq2xs[j] ? -1.f : 1.f);
+#else
+    assert(false);
+
+#endif
+
+}
+
+template<typename dst_t>
+static void dequantize_block_iq3_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy,
+                                     const sycl::nd_item<3> &item_ct1,
+                                     const uint32_t *iq3xxs_grid,
+                                     const uint8_t *ksigns_iq2xs,
+                                     const uint8_t *kmask_iq2xs) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq3_xxs * x = (const block_iq3_xxs  *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t  * q3 = x[i].qs + 8*ib;
+    const uint16_t * gas = (const uint16_t *)(x[i].qs + QK_K/4) + 2*ib;
+    const uint8_t  * grid1 = (const uint8_t *)(iq3xxs_grid + q3[2*il+0]);
+    const uint8_t  * grid2 = (const uint8_t *)(iq3xxs_grid + q3[2*il+1]);
+    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const float d = (float)x[i].d * (0.5f + (aux32 >> 28)) * 0.5f;
+    const uint8_t signs = ksigns_iq2xs[(aux32 >> 7*il) & 127];
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        y[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+#else
+    assert(false);
+#endif
+
+}
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq3_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                       const sycl::nd_item<3> &item_ct1,
+                       const uint8_t *kmask_iq2xs, const uint32_t *iq3s_grid) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq3_s * x = (const block_iq3_s *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint8_t * qs = x[i].qs + 8*ib;
+    const uint8_t * grid1 = (const uint8_t *)(iq3s_grid + (qs[2*il+0] | ((x[i].qh[ib] << (8-2*il)) & 256)));
+    const uint8_t * grid2 = (const uint8_t *)(iq3s_grid + (qs[2*il+1] | ((x[i].qh[ib] << (7-2*il)) & 256)));
+    const float d = (float)x[i].d * (1 + 2*((x[i].scales[ib/2] >> 4*(ib%2)) & 0xf));
+    const uint8_t signs = x[i].signs[4*ib + il];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j+0] = d * grid1[j] * (signs & kmask_iq2xs[j+0] ? -1.f : 1.f);
+        y[j+4] = d * grid2[j] * (signs & kmask_iq2xs[j+4] ? -1.f : 1.f);
+    }
+#else
+    assert(false);
+#endif
+
+}
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq1_s(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                       const sycl::nd_item<3> &item_ct1,
+                       const uint32_t *iq1s_grid_gpu) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq1_s * x = (const block_iq1_s  *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const float delta = x[i].qh[ib] & 0x8000 ? -1 - IQ1S_DELTA : -1 + IQ1S_DELTA;
+    const float d = (float)x[i].d * (2*((x[i].qh[ib] >> 12) & 7) + 1);
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1s_grid_gpu[x[i].qs[4*ib+il] | (((x[i].qh[ib] >> 3*il) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        y[j] = d * (q[j] + delta);
+    }
+#else
+    assert(false);
+#endif
+
+}
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq1_m(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                       const sycl::nd_item<3> &item_ct1,
+                       const uint32_t *iq1s_grid_gpu) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq1_m * x = (const block_iq1_m  *) vx;
+
+    const int tid = item_ct1.get_local_id(2);
+#if QK_K == 256
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 8*il;
+    const uint16_t * sc = (const uint16_t *)x[i].scales;
+    iq1m_scale_t scale;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const int ib16 = 2*ib + il/2; // sc[ib16/4] >> 3*(ib16%4) -> sc[ib/2] >> 3*((2*ib+il/2)%4);
+    const float d = (float)scale.f16 * (2*((sc[ib16/4] >> 3*(ib16%4)) & 0x7) + 1);
+    const float delta = x[i].qh[2*ib+il/2] & (0x08 << 4*(il%2)) ? -1 - IQ1M_DELTA : -1 + IQ1M_DELTA;
+    uint32_t grid32[2]; const int8_t * q = (const int8_t *)grid32;
+    grid32[0] = iq1s_grid_gpu[x[i].qs[4*ib+il] | (((x[i].qh[2*ib+il/2] >> 4*(il%2)) & 7) << 8)];
+    grid32[1] = (grid32[0] >> 4) & 0x0f0f0f0f;
+    grid32[0] &= 0x0f0f0f0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        y[j] = d * (q[j] + delta);
+    }
+#else
+    assert(false);
+#endif
+
+}
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq4_nl(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                        const sycl::nd_item<3> &item_ct1) {
+
+    const int i = item_ct1.get_group(2);
+    const block_iq4_nl * x = (const block_iq4_nl *) vx + i*(QK_K/QK4_NL);
+
+    const int tid = item_ct1.get_local_id(2);
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[ib].qs + 4*il;
+    const float d = (float)x[ib].d;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+
+}
+
+
+template <typename dst_t>
+__dpct_inline__ static void
+dequantize_block_iq4_xs(const void *__restrict__ vx, dst_t *__restrict__ yy,
+                        const sycl::nd_item<3> &item_ct1) {
+    const int i = item_ct1.get_group(2);
+    const block_iq4_xs * x = (const block_iq4_xs *)vx;
+
+    const int tid = item_ct1.get_local_id(2);
+    const int il = tid/8; // 0...3
+    const int ib = tid%8; // 0...7
+    dst_t * y = yy + i*QK_K + 32*ib + 4*il;
+    const uint8_t  * q4 = x[i].qs + 16*ib + 4*il;
+    const float d = (float)x[i].d * ((((x[i].scales_l[ib/2] >> 4*(ib%2)) & 0xf) | (((x[i].scales_h >> 2*ib) & 3) << 4)) - 32);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        y[j+ 0] = d * kvalues_iq4nl[q4[j] & 0xf];
+        y[j+16] = d * kvalues_iq4nl[q4[j] >>  4];
+    }
+}
+
+
 
 /*
 DPCT1110:4: The total declared local variable size in device function
@@ -4446,12 +4751,15 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
 
     }
 #else
-    const int tid = threadIdx.x/(2*K_QUANTS_PER_ITERATION);  // 0...15 or 0...7
-    const int ix  = threadIdx.x%(2*K_QUANTS_PER_ITERATION);  // 0....1 or 0...3
+    const int tid = item_ct1.get_local_id(2) /
+                    (2 * K_QUANTS_PER_ITERATION); // 0...15 or 0...7
+    const int ix = item_ct1.get_local_id(2) %
+                   (2 * K_QUANTS_PER_ITERATION); // 0....1 or 0...3
     const int offset = tid * K_QUANTS_PER_ITERATION;
 
     uint32_t uaux[2];
     const uint8_t * d = (const uint8_t *)uaux;
+
 
     for (int i = ix; i < num_blocks_per_row; i += 2*K_QUANTS_PER_ITERATION) {
 
@@ -4462,7 +4770,8 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
         uaux[0] = s[0] & 0x0f0f0f0f;
         uaux[1] = (s[0] >> 4) & 0x0f0f0f0f;
 
-        const float2 dall = __half22float2(x[i].dm);
+        const sycl::float2 dall =
+            x[i].dm.convert<float, sycl::rounding_mode::automatic>();
 
         float sum1 = 0, sum2 = 0;
         for (int l = 0; l < K_QUANTS_PER_ITERATION; ++l) {
@@ -4473,8 +4782,9 @@ static void dequantize_mul_mat_vec_q2_k(const void *__restrict__ vx,
                   + y[l+48] * d[3] * ((ql >> 6) & 3);
             sum2 += y[l+0] * d[4] + y[l+16] * d[5] + y[l+32] * d[6] + y[l+48] * d[7];
         }
-        tmp += dall.x * sum1 - dall.y * sum2;
+        tmp += dall.x() * sum1 - dall.y() * sum2;
     }
+
 #endif
 
     // sum up partial sums and write back result
@@ -4569,8 +4879,8 @@ static void dequantize_mul_mat_vec_q3_k(const void *__restrict__ vx,
     }
 #else
 
-    const int tid = threadIdx.x/(2*K_QUANTS_PER_ITERATION);  // 0...15 or 0...7
-    const int ix  = threadIdx.x%(2*K_QUANTS_PER_ITERATION);  // 0....1 or 0...3
+    const int tid = item_ct1.get_local_id(2)/(2*K_QUANTS_PER_ITERATION);  // 0...15 or 0...7
+    const int ix  = item_ct1.get_local_id(2)%(2*K_QUANTS_PER_ITERATION);  // 0....1 or 0...3
     const int offset = tid * K_QUANTS_PER_ITERATION;         // 0...15 or 0...14
     const int in = offset/8;                                 // 0 or 1
     const int im = offset%8;                                 // 0...7
@@ -4719,8 +5029,8 @@ static void dequantize_mul_mat_vec_q4_k(const void *__restrict__ vx,
 
     }
 #else
-    const int tid = threadIdx.x/(2*K_QUANTS_PER_ITERATION);  // 0...15
-    const int ix  = threadIdx.x%(2*K_QUANTS_PER_ITERATION);
+    const int tid = item_ct1.get_local_id(2)/(2*K_QUANTS_PER_ITERATION);  // 0...15
+    const int ix  = item_ct1.get_local_id(2)%(2*K_QUANTS_PER_ITERATION);
 
     const int step = tid * K_QUANTS_PER_ITERATION;
 
@@ -4860,8 +5170,8 @@ static void dequantize_mul_mat_vec_q5_k(const void *__restrict__ vx,
     }
 
 #else
-    const int tid = threadIdx.x/(2*K_QUANTS_PER_ITERATION);  // 0...15
-    const int ix  = threadIdx.x%(2*K_QUANTS_PER_ITERATION);
+    const int tid = item_ct1.get_local_id(2)/(2*K_QUANTS_PER_ITERATION);  // 0...15
+    const int ix  = item_ct1.get_local_id(2)%(2*K_QUANTS_PER_ITERATION);
     const int step = tid * K_QUANTS_PER_ITERATION;
     const int im = step/8;
     const int in = step%8;
@@ -4969,8 +5279,8 @@ static void dequantize_mul_mat_vec_q6_k(const void * __restrict__ vx, const floa
 
 #else
 
-    const int tid = threadIdx.x/(2*K_QUANTS_PER_ITERATION);  // 0...7
-    const int ix  = threadIdx.x%(2*K_QUANTS_PER_ITERATION);  // 0...3
+    const int tid = item_ct1.get_local_id(2)/(2*K_QUANTS_PER_ITERATION);  // 0...7
+    const int ix  = item_ct1.get_local_id(2)%(2*K_QUANTS_PER_ITERATION);  // 0...3
 
     const int step = tid * K_QUANTS_PER_ITERATION;
 
@@ -5168,6 +5478,21 @@ static void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ 
 
     y[iybs + iqs + 0] = v.x();
     y[iybs + iqs + y_offset] = v.y();
+}
+
+template <typename src_t, typename dst_t>
+static void convert_unary(const void * __restrict__ vx, dst_t * __restrict__ y, const int k,
+                          const sycl::nd_item<3> &item_ct1) {
+    const int i = item_ct1.get_local_range(2) * item_ct1.get_group(2) +
+                  item_ct1.get_local_id(2);
+
+    if (i >= k) {
+        return;
+    }
+
+    const src_t * x = (src_t *) vx;
+
+    y[i] = x[i];
 }
 
 // VDR = vec dot ratio, how many contiguous integers each thread processes when the vec dot kernel is called
@@ -6588,8 +6913,8 @@ vec_dot_q4_K_q8_1(const void *__restrict__ vbq,
     const float dall = bq4_K->dm[0];
     const float dmin = bq4_K->dm[1];
 
-    const float d8_1 = __low2float(bq8_1[0].ds);
-    const float d8_2 = __low2float(bq8_1[1].ds);
+    const float d8_1 = bq8_1[0].ds[0];
+    const float d8_2 = bq8_1[1].ds[1];
 
     const int ui1 = *((const int *)bq8_1[0].qs + (iqs/2));
     const int ui2 = *((const int *)bq8_1[0].qs + (iqs/2) + 4);
@@ -6600,10 +6925,10 @@ vec_dot_q4_K_q8_1(const void *__restrict__ vbq,
     const int v1 = q4[0];
     const int v2 = q4[4];
 
-    const int dot1 = __dp4a(ui2, v2 & 0x0f0f0f0f, __dp4a(ui1, v1 & 0x0f0f0f0f, 0));
-    const int dot2 = __dp4a(ui4, (v2 >> 4) & 0x0f0f0f0f, __dp4a(ui3, (v1 >> 4) & 0x0f0f0f0f, 0));
-    const int dot3 = __dp4a(0x01010101, ui2, __dp4a(0x01010101, ui1, 0));
-    const int dot4 = __dp4a(0x01010101, ui4, __dp4a(0x01010101, ui3, 0));
+    const int dot1 = dpct::dp4a(ui2, v2 & 0x0f0f0f0f, dpct::dp4a(ui1, v1 & 0x0f0f0f0f, 0));
+    const int dot2 = dpct::dp4a(ui4, (v2 >> 4) & 0x0f0f0f0f, dpct::dp4a(ui3, (v1 >> 4) & 0x0f0f0f0f, 0));
+    const int dot3 = dpct::dp4a(0x01010101, ui2, dpct::dp4a(0x01010101, ui1, 0));
+    const int dot4 = dpct::dp4a(0x01010101, ui4, dpct::dp4a(0x01010101, ui3, 0));
 
     sumf_d += d8_1 * (dot1 * s[0]) + d8_2 * (dot2 * s[1]);
     sumf_m += d8_1 * (dot3 * s[2]) + d8_2 * (dot4 * s[3]);
@@ -6772,8 +7097,8 @@ vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
 
     const float d = bq5_K->d;
 
-    const float d8_1 = __low2half(bq8_1[0].ds);
-    const float d8_2 = __low2half(bq8_1[1].ds);
+    const float d8_1 = bq8_1[0].ds[0];
+    const float d8_2 = bq8_1[1].ds[1];
 
     const int ui1 = *((const int *)bq8_1[0].qs + (iqs/2));
     const int ui2 = *((const int *)bq8_1[0].qs + (iqs/2) + 4);
@@ -6794,8 +7119,8 @@ vec_dot_q5_K_q8_1(const void *__restrict__ vbq,
     const int v3 = (((vh >> 0) & 0x10101010) ^ 0x10101010) | ((vl1 >> 4) & 0x0f0f0f0f);
     const int v4 = (((vh >> 2) & 0x10101010) ^ 0x10101010) | ((vl2 >> 4) & 0x0f0f0f0f);
 
-    const float sumf_d = d8_1 * (__dp4a(ui1, v1, 0) * s[0] + __dp4a(ui2, v2, 0) * s[1])
-                       + d8_2 * (__dp4a(ui3, v3, 0) * s[2] + __dp4a(ui4, v4, 0) * s[3]);
+    const float sumf_d = d8_1 * (dpct::dp4a(ui1, v1, 0) * s[0] + dpct::dp4a(ui2, v2, 0) * s[1])
+                       + d8_2 * (dpct::dp4a(ui3, v3, 0) * s[2] + dpct::dp4a(ui4, v4, 0) * s[3]);
 
     return d * sumf_d;
 
@@ -7049,6 +7374,368 @@ static __dpct_inline__ float vec_dot_q6_K_q8_1_mul_mat(
     const int index_x = i * (QR6_K*WARP_SIZE + 1) +  QR6_K*k;
     const int index_y = j * WARP_SIZE             + (QR6_K*k) % WARP_SIZE;
     return vec_dot_q6_K_q8_1_impl_mmq(&x_ql[index_x], &y_qs[index_y], sc, x_dmf[i * (WARP_SIZE/QI6_K) + i/QI6_K], &y_df[index_y/QI8_1]);
+}
+
+
+static __dpct_inline__ float
+vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
+                     const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                     const uint64_t *iq2xxs_grid, const uint8_t *ksigns_iq2xs,
+                     const uint8_t *kmask_iq2xs) {
+#if QK_K == 256
+    const block_iq2_xxs * bq2 = (const block_iq2_xxs *) vbq;
+
+#if QR2_XXS == 8
+    const int ib32 = iqs;
+    const uint16_t * q2 = bq2->qs + 4*ib32;
+    const uint8_t  * aux8 = (const uint8_t *)q2;
+    const int8_t   * q8 = bq8_1[ib32].qs;
+    uint32_t aux32 = q2[2] | (q2[3] << 16);
+    int sumi = 0;
+    for (int l = 0; l < 4; ++l) {
+        const uint8_t * grid = (const uint8_t *)(iq2xxs_grid + aux8[l]);
+        const uint8_t  signs = ksigns_iq2xs[aux32 & 127];
+        for (int j = 0; j < 8; ++j) {
+            sumi += q8[j] * grid[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+        }
+        q8 += 8;
+        aux32 >>= 7;
+    }
+    const float d = (float)bq2->d * (0.5f + aux32) * bq8_1[ib32].ds[0] * 0.25f;
+    return d * sumi;
+#else
+    // iqs is 0...15
+    const int ib32 = iqs/2;
+    const int il = iqs%2;
+    const uint16_t * q2 = bq2->qs + 4*ib32;
+    const uint8_t  * aux8 = (const uint8_t *)q2;
+    const uint8_t  * grid1 = (const uint8_t *)(iq2xxs_grid + aux8[2*il+0]);
+    const uint8_t  * grid2 = (const uint8_t *)(iq2xxs_grid + aux8[2*il+1]);
+    const uint32_t aux32 = q2[2] | (q2[3] << 16);
+    const float d = (float)bq2->d * (0.5f + (aux32 >> 28)) * bq8_1[ib32].ds[0] * 0.25f;
+    const uint8_t signs1 = ksigns_iq2xs[(aux32 >> 14*il) & 127];
+    const uint8_t signs2 = ksigns_iq2xs[(aux32 >> (14*il + 7)) & 127];
+    const int8_t * q8 = bq8_1[ib32].qs + 16*il;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 8; ++j) {
+        sumi1 += q8[j+0] * grid1[j] * (signs1 & kmask_iq2xs[j] ? -1 : 1);
+        sumi2 += q8[j+8] * grid2[j] * (signs2 & kmask_iq2xs[j] ? -1 : 1);
+    }
+    return d * (sumi1 + sumi2);
+#endif
+#else
+    assert(false);
+    return 0.f;
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                    const uint64_t *iq2xs_grid, const uint64_t *ksigns64) {
+#if DPCT_COMPATIBILITY_TEMP >=                                                 \
+    MIN_CC_DP4A // lowest compute capability for integer intrinsics
+#if QK_K == 256
+    const block_iq2_xs * bq2 = (const block_iq2_xs *) vbq;
+
+    const int ib32 = iqs;
+    const uint16_t * q2 = bq2->qs + 4*ib32;
+    const int8_t   * q8 = bq8_1[ib32].qs;
+    const uint8_t ls1 = bq2->scales[ib32] & 0xf;
+    const uint8_t ls2 = bq2->scales[ib32] >>  4;
+    int sumi1 = 0;
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
+        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid[0] ^ signs[0], signs[0], std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid[1] ^ signs[1], signs[1], std::minus<>());
+        sumi1 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi1);
+        sumi1 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi1);
+        q8 += 8;
+    }
+    int sumi2 = 0;
+    for (int l = 2; l < 4; ++l) {
+        const uint32_t * grid = (const uint32_t *)(iq2xs_grid + (q2[l] & 511));
+        const uint32_t * signs = (const uint32_t *)(ksigns64 + (q2[l] >> 9));
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid[0] ^ signs[0], signs[0], std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid[1] ^ signs[1], signs[1], std::minus<>());
+        sumi2 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi2);
+        sumi2 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi2);
+        q8 += 8;
+    }
+    const float d = (float)bq2->d * bq8_1[ib32].ds[0] * 0.25f;
+    return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
+#else
+    assert(false);
+    return 0.f;
+#endif
+#else
+    assert(false);
+    return 0.f;
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+#if QK_K == 256
+    const block_iq2_s * bq2 = (const block_iq2_s *) vbq;
+
+    const int ib32 = iqs;
+    const int8_t  * q8 = bq8_1[ib32].qs;
+    const uint8_t * signs = bq2->qs + QK_K/8 + 4*ib32;
+    const uint8_t ls1 = bq2->scales[ib32] & 0xf;
+    const uint8_t ls2 = bq2->scales[ib32] >>  4;
+    int sumi1 = 0;
+    for (int l = 0; l < 2; ++l) {
+        const uint32_t * grid = (const uint32_t *)(iq2s_grid + (bq2->qs[4*ib32+l] | ((bq2->qh[ib32] << (8-2*l)) & 0x300)));
+        const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+            ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201,
+            std::equal_to<>());
+        const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+            ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201,
+            std::equal_to<>());
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid[0] ^ signs0, signs0, std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid[1] ^ signs1, signs1, std::minus<>());
+        sumi1 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi1);
+        sumi1 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi1);
+        q8 += 8;
+    }
+    int sumi2 = 0;
+    for (int l = 2; l < 4; ++l) {
+        const uint32_t * grid = (const uint32_t *)(iq2s_grid + (bq2->qs[4*ib32+l] | ((bq2->qh[ib32] << (8-2*l)) & 0x300)));
+        const uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+            ((signs[l] & 0xf) * 0x01010101) & 0x08040201, 0x08040201,
+            std::equal_to<>());
+        const uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+            ((signs[l] >> 4) * 0x01010101) & 0x08040201, 0x08040201,
+            std::equal_to<>());
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid[0] ^ signs0, signs0, std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid[1] ^ signs1, signs1, std::minus<>());
+        sumi2 = dpct::dp4a(grid_l, *((const int *)q8 + 0), sumi2);
+        sumi2 = dpct::dp4a(grid_h, *((const int *)q8 + 1), sumi2);
+        q8 += 8;
+    }
+    const float d = (float)bq2->d * bq8_1[ib32].ds[0] * 0.25f;
+    return d * ((0.5f + ls1) * sumi1 + (0.5f + ls2) * sumi2);
+#else
+    assert(false);
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
+                     const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                     const uint32_t *iq3xxs_grid, const uint64_t *ksigns64) {
+#if DPCT_COMPATIBILITY_TEMP >=                                                 \
+    MIN_CC_DP4A // lowest compute capability for integer intrinsics
+#if QK_K == 256
+    const block_iq3_xxs * bq2 = (const block_iq3_xxs *) vbq;
+
+    const int ib32 = iqs;
+    const uint8_t  * q3 = bq2->qs + 8*ib32;
+    const uint16_t * gas = (const uint16_t *)(bq2->qs + QK_K/4) + 2*ib32;
+    const int8_t   * q8 = bq8_1[ib32].qs;
+    uint32_t aux32 = gas[0] | (gas[1] << 16);
+    int sumi = 0;
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t * grid1 = iq3xxs_grid + q3[2*l+0];
+        const uint32_t * grid2 = iq3xxs_grid + q3[2*l+1];
+        const uint32_t * signs = (const uint32_t *)(ksigns64 + (aux32 & 127));
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid1[0] ^ signs[0], signs[0], std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid2[0] ^ signs[1], signs[1], std::minus<>());
+        sumi = dpct::dp4a(grid_l, *((int *)q8 + 0), sumi);
+        sumi = dpct::dp4a(grid_h, *((int *)q8 + 1), sumi);
+        q8 += 8;
+        aux32 >>= 7;
+    }
+    const float d = (float)bq2->d * (0.5f + aux32) * bq8_1[ib32].ds[0] * 0.5f;
+    return d * sumi;
+#else
+    assert(false);
+    return 0.f;
+#endif
+#else
+    assert(false);
+    return 0.f;
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                   const uint32_t *iq3s_grid) {
+#if QK_K == 256
+    const block_iq3_s * bq2 = (const block_iq3_s *) vbq;
+
+    const int ib32 = iqs;
+    const uint8_t  * qs = bq2->qs + 8*ib32;
+    const int8_t   * q8 = bq8_1[ib32].qs;
+    int sumi = 0;
+    for (int l = 0; l < 4; ++l) {
+        const uint32_t * grid1 = iq3s_grid + (qs[2*l+0] | ((bq2->qh[ib32] << (8 - 2*l)) & 256));
+        const uint32_t * grid2 = iq3s_grid + (qs[2*l+1] | ((bq2->qh[ib32] << (7 - 2*l)) & 256));
+        uint32_t signs0 = dpct::vectorized_binary<sycl::uchar4>(
+            ((bq2->signs[4 * ib32 + l] & 0xf) * 0x01010101) & 0x08040201,
+            0x08040201, std::equal_to<>());
+        uint32_t signs1 = dpct::vectorized_binary<sycl::uchar4>(
+            ((bq2->signs[4 * ib32 + l] >> 4) * 0x01010101) & 0x08040201,
+            0x08040201, std::equal_to<>());
+        const int grid_l = dpct::vectorized_binary<sycl::uchar4>(
+            grid1[0] ^ signs0, signs0, std::minus<>());
+        const int grid_h = dpct::vectorized_binary<sycl::uchar4>(
+            grid2[0] ^ signs1, signs1, std::minus<>());
+        sumi = dpct::dp4a(grid_l, *((int *)q8 + 0), sumi);
+        sumi = dpct::dp4a(grid_h, *((int *)q8 + 1), sumi);
+        q8 += 8;
+    }
+    const float d =
+        (float)bq2->d *
+        (1 + 2 * ((bq2->scales[ib32 / 2] >> 4 * (ib32 % 2)) & 0xf)) *
+        bq8_1[ib32].ds[0];
+    return d * sumi;
+#else
+    assert(false);
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq1_s_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs,
+                   const uint32_t *iq1s_grid_gpu) {
+#if QK_K == 256
+    const block_iq1_s * bq1 = (const block_iq1_s *) vbq;
+
+    const int ib32 = iqs;
+    int sumi = 0;
+    const int * q8 = (const int *)bq8_1[ib32].qs;
+    for (int l = 0; l < 4; ++l) {
+        const int * grid = (const int *)(iq1s_grid_gpu + (bq1->qs[4*ib32+l] | (((bq1->qh[ib32] >> 3*l) & 7) << 8)));
+        int grid0 = grid[0] & 0x0f0f0f0f;
+        int grid1 = (grid[0] >> 4) & 0x0f0f0f0f;
+        sumi = dpct::dp4a(q8[2 * l + 1], grid1,
+                          dpct::dp4a(q8[2 * l + 0], grid0, sumi));
+    }
+
+    const float delta = bq1->qh[ib32] & 0x8000 ? -1-IQ1S_DELTA : -1+IQ1S_DELTA;
+    const float d1q = (float)bq1->d * (2*((bq1->qh[ib32] >> 12) & 7) + 1);
+    const float d = d1q * bq8_1[ib32].ds[0];
+    const float m = d1q * bq8_1[ib32].ds[1];
+    return d * sumi + m * delta;
+#else
+    assert(false);
+#endif
+}
+
+static __dpct_inline__ float
+vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
+                   const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+#if QK_K == 256
+    const block_iq1_m * bq1 = (const block_iq1_m *) vbq;
+
+    const int ib32 = iqs;
+    int   sumi[2] = {0, 0};
+    float sumf[2] = {0.f, 0.f};
+
+    const int * q8 = (const int *)bq8_1[ib32].qs;
+    for (int l = 0; l < 4; ++l) {
+        const int * grid = (const int *)(iq1s_grid_gpu + (bq1->qs[4*ib32+l] | (((bq1->qh[2*ib32+l/2] >> 4*(l%2)) & 7) << 8)));
+        int grid0 = grid[0] & 0x0f0f0f0f;
+        int grid1 = (grid[0] >> 4) & 0x0f0f0f0f;
+        sumi[l / 2] = dpct::dp4a(q8[2 * l + 1], grid1,
+                                 dpct::dp4a(q8[2 * l + 0], grid0, sumi[l / 2]));
+        const float delta = (bq1->qh[2*ib32+l/2] >> 4*(l%2)) & 0x08 ? -1-IQ1M_DELTA : -1+IQ1M_DELTA;
+        const int sumy = dpct::dp4a(q8[2 * l + 1], 0x01010101,
+                                    dpct::dp4a(q8[2 * l + 0], 0x01010101, 0));
+        sumf[l/2] += delta*sumy;
+    }
+
+    iq1m_scale_t scale;
+    const uint16_t * sc = (const uint16_t *)bq1->scales;
+    scale.u16 = (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000);
+    const float d = (float)scale.f16 * bq8_1[ib32].ds[0];
+    return d * ((sumi[0] + sumf[0]) * (2*((sc[ib32/2] >> 6*(ib32%2)) & 0x7) + 1) + (sumi[1] + sumf[1]) * (2*((sc[ib32/2] >> (6*(ib32%2)+3)) & 0x7) + 1));
+#else
+    assert(false);
+#endif
+}
+
+static __dpct_inline__ void get_int_from_table_16(const uint32_t &q4,
+                                                  const uint8_t *values,
+                                                  int &val1, int &val2) {
+
+    uint32_t aux32; const uint8_t * q8 = (const uint8_t *)&aux32;
+    aux32 = q4 & 0x0f0f0f0f;
+    uint16_t v1 = values[q8[0]] | (values[q8[1]] << 8);
+    uint16_t v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val1 = v1 | (v2 << 16);
+    aux32 = (q4 >> 4) & 0x0f0f0f0f;
+    v1 = values[q8[0]] | (values[q8[1]] << 8);
+    v2 = values[q8[2]] | (values[q8[3]] << 8);
+    val2 = v1 | (v2 << 16);
+}
+
+
+static __dpct_inline__ float
+vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+
+    const block_iq4_nl * bq = (const block_iq4_nl *) vbq;
+
+    const uint16_t * q4 = (const uint16_t *)bq->qs + 2*iqs;
+    const int32_t  * q8 = (const int32_t  *)bq8_1->qs + iqs;
+
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int l = 0; l < VDR_Q4_0_Q8_1_MMVQ; ++l) {
+        const uint32_t aux = q4[2*l] | (q4[2*l+1] << 16);
+        get_int_from_table_16(aux, values, v1, v2);
+        sumi1 = dpct::dp4a(v1, q8[l + 0], sumi1);
+        sumi2 = dpct::dp4a(v2, q8[l + 4], sumi2);
+    }
+
+    const float d = (float)bq->d * bq8_1->ds[0];
+    return d * (sumi1 + sumi2);
+}
+
+
+static __dpct_inline__ float
+vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
+                    const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
+
+#if QK_K == 256
+    const block_iq4_xs * bq4 = (const block_iq4_xs *) vbq;
+    const uint8_t * values = (const uint8_t *)kvalues_iq4nl;
+
+    // iqs is 0...7
+    const int ib32 = iqs;
+    const int32_t  * q8 = (const int *)bq8_1[ib32].qs;
+    const uint32_t * q4 = (const uint32_t *)bq4->qs + 4*ib32;
+    const int8_t ls = ((bq4->scales_l[ib32/2] >> 4*(ib32%2)) & 0xf) | (((bq4->scales_h >> 2*ib32) & 3) << 4);
+    const float d = (float)bq4->d * (ls - 32) * bq8_1[ib32].ds[0];
+    int v1, v2;
+    int sumi1 = 0, sumi2 = 0;
+    for (int j = 0; j < 4; ++j) {
+        get_int_from_table_16(q4[j], values, v1, v2);
+        sumi1 = dpct::dp4a(v1, q8[j + 0], sumi1);
+        sumi2 = dpct::dp4a(v2, q8[j + 4], sumi2);
+    }
+    return d * (sumi1 + sumi2);
+#else
+    assert(false);
+#endif
 }
 
 template <int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x,
@@ -7649,12 +8336,11 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
     const block_q_t  * x = (const block_q_t  *) vx;
     const block_q8_1 * y = (const block_q8_1 *) vy;
 
-    for (int i = 0; i < blocks_per_row; i += blocks_per_warp) {
-        const int ibx = row * blocks_per_row + i +
-                        item_ct1.get_local_id(2) / (qi / vdr); // x block index
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
 
-        const int iby = (i + item_ct1.get_local_id(2) / (qi / vdr)) *
-                        (qk / QK8_1); // y block index that aligns with ibx
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
 
         const int iqs =
             vdr *
@@ -7675,6 +8361,440 @@ static void mul_mat_vec_q(const void * __restrict__ vx, const void * __restrict_
         dst[row] = tmp;
     }
 }
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq2_xxs_q8_1(const void *__restrict__ vx,
+                                       const void *__restrict__ vy,
+                                       float *__restrict__ dst, const int ncols,
+                                       const int nrows,
+                                       const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq2_xxs_q8_1(&x[ibx], &y[iby], iqs, iq2xxs_grid, ksigns_iq2xs, kmask_iq2xs);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq2_xs_q8_1(const void *__restrict__ vx,
+                                      const void *__restrict__ vy,
+                                      float *__restrict__ dst, const int ncols,
+                                      const int nrows,
+                                      const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq2_xs_q8_1(&x[ibx], &y[iby], iqs, iq2xs_grid, ksigns64);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq2_s_q8_1(const void *__restrict__ vx,
+                                     const void *__restrict__ vy,
+                                     float *__restrict__ dst, const int ncols,
+                                     const int nrows,
+                                     const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq2_s_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq3_xxs_q8_1(const void *__restrict__ vx,
+                                       const void *__restrict__ vy,
+                                       float *__restrict__ dst, const int ncols,
+                                       const int nrows,
+                                       const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq3_xxs_q8_1(&x[ibx], &y[iby], iqs, iq3xxs_grid, ksigns64);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq3_s_q8_1(const void *__restrict__ vx,
+                                     const void *__restrict__ vy,
+                                     float *__restrict__ dst, const int ncols,
+                                     const int nrows,
+                                     const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq3_s_q8_1(&x[ibx], &y[iby], iqs, iq3s_grid);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq1_s_q8_1(const void *__restrict__ vx,
+                                     const void *__restrict__ vy,
+                                     float *__restrict__ dst, const int ncols,
+                                     const int nrows,
+                                     const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq1_s_q8_1(&x[ibx], &y[iby], iqs, iq1s_grid_gpu);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq1_m_q8_1(const void *__restrict__ vx,
+                                     const void *__restrict__ vy,
+                                     float *__restrict__ dst, const int ncols,
+                                     const int nrows,
+                                     const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq1_m_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq4_nl_q8_1(const void *__restrict__ vx,
+                                      const void *__restrict__ vy,
+                                      float *__restrict__ dst, const int ncols,
+                                      const int nrows,
+                                      const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq4_nl_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
+
+template <int qk, int qi, typename block_q_t, int vdr>
+static void mul_mat_vec_q_iq4_xs_q8_1(const void *__restrict__ vx,
+                                      const void *__restrict__ vy,
+                                      float *__restrict__ dst, const int ncols,
+                                      const int nrows,
+                                      const sycl::nd_item<3> &item_ct1) {
+    const int row = item_ct1.get_group(2) * item_ct1.get_local_range(1) +
+                    item_ct1.get_local_id(1);
+
+    if (row >= nrows) {
+        return;
+    }
+
+    const int blocks_per_row = ncols / qk;
+    const int blocks_per_warp = vdr * WARP_SIZE / qi;
+
+// partial sum for each thread
+    float tmp = 0.0f;
+
+    const block_q_t  * x = (const block_q_t  *) vx;
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    for (int i = item_ct1.get_local_id(2) / (qi / vdr); i < blocks_per_row;
+         i += blocks_per_warp) {
+        const int ibx = row*blocks_per_row + i; // x block index
+
+        const int iby = i * (qk/QK8_1); // y block index that aligns with ibx
+
+        const int iqs =
+            vdr *
+            (item_ct1.get_local_id(2) %
+             (qi / vdr)); // x block quant index when casting the quants to int
+
+        tmp += vec_dot_iq4_xs_q8_1(&x[ibx], &y[iby], iqs);
+    }
+
+    // sum up partial sums and write back result
+#pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        tmp +=
+            dpct::permute_sub_group_by_xor(item_ct1.get_sub_group(), tmp, mask);
+    }
+
+    if (item_ct1.get_local_id(2) == 0) {
+        dst[row] = tmp;
+    }
+}
+
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel>
 static void dequantize_mul_mat_vec(const void * __restrict__ vx, const dfloat * __restrict__ y, float * __restrict__ dst, const int ncols, const int nrows,
@@ -8237,63 +9357,70 @@ static void k_sum_rows_f32(const float * x, float * dst, const int ncols,
     }
 }
 
+
 template<typename T>
-static inline void swap(T & a, T & b) {
+static inline void ggml_sycl_swap(T & a, T & b) {
     T tmp = a;
     a = b;
     b = tmp;
 }
 
-template<ggml_sort_order order>
-static void k_argsort_f32_i32(const float * x, int * dst, const int ncols,
-                              const sycl::nd_item<3> &item_ct1) {
+template <ggml_sort_order order>
+__dpct_inline__ static void
+k_argsort_f32_i32(const float *x, int *dst, const int ncols, int ncols_pad,
+                  const sycl::nd_item<3> &item_ct1, uint8_t *dpct_local) {
     // bitonic sort
     int col = item_ct1.get_local_id(2);
     int row = item_ct1.get_group(1);
 
-    if (col >= ncols) return;
+    if (col >= ncols_pad) {
+        return;
+    }
 
     const float * x_row = x + row * ncols;
-    int * dst_row = dst + row * ncols;
+    auto dst_row = (int *)dpct_local;
 
     // initialize indices
-    if (col < ncols) {
-        dst_row[col] = col;
-    }
-    /*
-    DPCT1065:58: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
+    dst_row[col] = col;
 
-    for (int k = 2; k <= ncols; k *= 2) {
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+
+    for (int k = 2; k <= ncols_pad; k *= 2) {
         for (int j = k / 2; j > 0; j /= 2) {
             int ixj = col ^ j;
             if (ixj > col) {
                 if ((col & k) == 0) {
-                    if (order == GGML_SORT_ORDER_ASC ? x_row[dst_row[col]] > x_row[dst_row[ixj]] : x_row[dst_row[col]] < x_row[dst_row[ixj]]) {
-                        swap(dst_row[col], dst_row[ixj]);
+                    if (dst_row[col] >= ncols ||
+                        (dst_row[ixj] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                            x_row[dst_row[col]] > x_row[dst_row[ixj]] :
+                            x_row[dst_row[col]] < x_row[dst_row[ixj]]))
+                    ) {
+                        ggml_sycl_swap(dst_row[col], dst_row[ixj]);
                     }
                 } else {
-                    if (order == GGML_SORT_ORDER_ASC ? x_row[dst_row[col]] < x_row[dst_row[ixj]] : x_row[dst_row[col]] > x_row[dst_row[ixj]]) {
-                        swap(dst_row[col], dst_row[ixj]);
+                    if (dst_row[ixj] >= ncols ||
+                        (dst_row[col] < ncols && (order == GGML_SORT_ORDER_ASC ?
+                            x_row[dst_row[col]] < x_row[dst_row[ixj]] :
+                            x_row[dst_row[col]] > x_row[dst_row[ixj]]))
+                    ) {
+                        ggml_sycl_swap(dst_row[col], dst_row[ixj]);
                     }
                 }
             }
             /*
-            DPCT1118:11: SYCL group functions and algorithms must be encountered
+            DPCT1118:1: SYCL group functions and algorithms must be encountered
             in converged control flow. You may need to adjust the code.
             */
-            /*
-            DPCT1065:59: Consider replacing sycl::nd_item::barrier() with
-            sycl::nd_item::barrier(sycl::access::fence_space::local_space) for
-            better performance if there is no access to global memory.
-            */
-            item_ct1.barrier();
+            item_ct1.barrier(sycl::access::fence_space::local_space);
         }
     }
+
+    // copy the result to dst without the padding
+    if (col < ncols) {
+        dst[row * ncols + col] = dst_row[col];
+    }
 }
+
 
 static void diag_mask_inf_f32(const float * x, float * dst, const int ncols, const int rows_per_channel, const int n_past,
                               const sycl::nd_item<3> &item_ct1) {
@@ -9109,7 +10236,18 @@ static void dequantize_row_q2_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q2_K<<<nb, 32, 0, stream>>>(vx, y);
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q2_K(vx, y, item_ct1);
+                             });
+    }
+
 #endif
 }
 
@@ -9130,9 +10268,56 @@ static void dequantize_row_q3_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q3_K<<<nb, 32, 0, stream>>>(vx, y);
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q3_K(vx, y, item_ct1);
+                             });
+    }
 #endif
 }
+
+template <typename dst_t>
+static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int k,
+                                     dpct::queue_ptr stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q4_0(vx, y, nb32, item_ct1);
+                             });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_q4_1_sycl(const void *vx, dst_t *y, const int k,
+                                     dpct::queue_ptr stream) {
+    const int nb32 = k / 32;
+    const int nb = (k + 255) / 256;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q4_1(vx, y, nb32, item_ct1);
+                             });
+    }
+}
+
 
 template <typename dst_t>
 static void dequantize_row_q4_K_sycl(const void *vx, dst_t *y, const int k,
@@ -9168,7 +10353,18 @@ static void dequantize_row_q5_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q5_K<<<nb, 32, 0, stream>>>(vx, y);
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q5_K(vx, y, item_ct1);
+                             });
+    }
+
 #endif
 }
 
@@ -9189,11 +10385,236 @@ static void dequantize_row_q6_K_sycl(const void *vx, dst_t *y, const int k,
                              });
     }
 #else
-    dequantize_block_q6_K<<<nb, 32, 0, stream>>>(vx, y);
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_q6_K(vx, y, item_ct1);
+                             });
+    }
+
 #endif
 }
 
-static to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type) {
+template <typename dst_t>
+static void dequantize_row_iq1_s_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq1_s(
+                                     vx, y, item_ct1, iq1s_grid_gpu
+                                     );
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq1_m_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq1_m(
+                                     vx, y, item_ct1, iq1s_grid_gpu
+                                     );
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_xxs_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq2_xxs(
+                                     vx, y, item_ct1, iq2xxs_grid,
+                                     ksigns_iq2xs, kmask_iq2xs);
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_xs_sycl(const void *vx, dst_t *y, const int k,
+                                       dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq2_xs(
+                                     vx, y, item_ct1, iq2xs_grid,
+                                     ksigns_iq2xs, kmask_iq2xs);
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq2_s_sycl(const void *vx, dst_t *y, const int k,
+                                      dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq2_s(vx, y, item_ct1);
+                             });
+        });
+    }
+}
+
+
+template <typename dst_t>
+static void dequantize_row_iq3_xxs_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq3_xxs(
+                                     vx, y, item_ct1, iq3xxs_grid,
+                                     ksigns_iq2xs, kmask_iq2xs);
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq3_s_sycl(const void *vx, dst_t *y, const int k,
+                                        dpct::queue_ptr stream) {
+    const int nb = k / QK_K;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                                   sycl::range<3>(1, 1, 32),
+                                               sycl::range<3>(1, 1, 32)),
+                             [=](sycl::nd_item<3> item_ct1) {
+                                 dequantize_block_iq3_s(
+                                     vx, y, item_ct1, kmask_iq2xs, iq3s_grid);
+                             });
+        });
+    }
+}
+
+template <typename dst_t>
+static void dequantize_row_iq4_xs_sycl(const void *vx, dst_t *y, const int k,
+                                       dpct::queue_ptr stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+#if QK_K == 64
+    dequantize_row_iq4_nl_sycl(vx, y, k, stream);
+#else
+      {
+            dpct::has_capability_or_fail(stream->get_device(),
+                                         {sycl::aspect::fp16});
+
+            stream->submit([&](sycl::handler &cgh) {
+                  cgh.parallel_for(
+                      sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                            sycl::range<3>(1, 1, 32),
+                                        sycl::range<3>(1, 1, 32)),
+                      [=](sycl::nd_item<3> item_ct1) {
+                            dequantize_block_iq4_xs(vx, y, item_ct1);
+                      });
+            });
+      }
+#endif
+}
+
+
+template <typename dst_t>
+static void dequantize_row_iq4_nl_sycl(const void *vx, dst_t *y, const int k,
+                                       dpct::queue_ptr stream) {
+    const int nb = (k + QK_K - 1) / QK_K;
+      {
+            dpct::has_capability_or_fail(stream->get_device(),
+                                         {sycl::aspect::fp16});
+
+            stream->submit([&](sycl::handler &cgh) {
+                  cgh.parallel_for(
+                      sycl::nd_range<3>(sycl::range<3>(1, 1, nb) *
+                                            sycl::range<3>(1, 1, 32),
+                                        sycl::range<3>(1, 1, 32)),
+                      [=](sycl::nd_item<3> item_ct1) {
+                            dequantize_block_iq4_nl(vx, y, item_ct1);
+                      });
+            });
+      }
+}
+
+
+
+template <typename src_t, typename dst_t>
+static void convert_unary_sycl(const void *__restrict__ vx,
+                               dst_t *__restrict__ y, const int k,
+                               dpct::queue_ptr stream) {
+    const int num_blocks = (k + SYCL_DEQUANTIZE_BLOCK_SIZE - 1) / SYCL_DEQUANTIZE_BLOCK_SIZE;
+    {
+        dpct::has_capability_or_fail(stream->get_device(),
+                                     {sycl::aspect::fp16});
+
+        stream->parallel_for(
+            sycl::nd_range<3>(
+                sycl::range<3>(1, 1, num_blocks) *
+                    sycl::range<3>(1, 1, SYCL_DEQUANTIZE_BLOCK_SIZE),
+                sycl::range<3>(1, 1, SYCL_DEQUANTIZE_BLOCK_SIZE)),
+            [=](sycl::nd_item<3> item_ct1) {
+                convert_unary<src_t>(vx, y, k, item_ct1);
+            });
+    }
+}
+
+
+static to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type) try {
+    int id;
     switch (type) {
         case GGML_TYPE_Q4_0:
             return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
@@ -9215,19 +10636,42 @@ static to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type) {
             return dequantize_row_q5_K_sycl;
         case GGML_TYPE_Q6_K:
             return dequantize_row_q6_K_sycl;
+        case GGML_TYPE_IQ1_S:
+            return dequantize_row_iq1_s_sycl;
+        case GGML_TYPE_IQ1_M:
+            return dequantize_row_iq1_m_sycl;
+        case GGML_TYPE_IQ2_XXS:
+            return dequantize_row_iq2_xxs_sycl;
+        case GGML_TYPE_IQ2_XS:
+            return dequantize_row_iq2_xs_sycl;
+        case GGML_TYPE_IQ2_S:
+            return dequantize_row_iq2_s_sycl;
+        case GGML_TYPE_IQ3_XXS:
+            return dequantize_row_iq3_xxs_sycl;
+        case GGML_TYPE_IQ3_S:
+            return dequantize_row_iq3_s_sycl;
+        case GGML_TYPE_IQ4_XS:
+            return dequantize_row_iq4_xs_sycl;
+        case GGML_TYPE_IQ4_NL:
+            return dequantize_row_iq4_nl_sycl;
         case GGML_TYPE_F32:
-            return dequantize_block_sycl<1, 1, convert_f32>;
+            return convert_unary_sycl<float>;
         default:
             return nullptr;
     }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
 }
 
 static to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type) {
     switch (type) {
         case GGML_TYPE_Q4_0:
-            return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
+            return dequantize_row_q4_0_sycl;
         case GGML_TYPE_Q4_1:
-            return dequantize_block_sycl<QK4_1, QR4_1, dequantize_q4_1>;
+            return dequantize_row_q4_1_sycl;
         case GGML_TYPE_Q5_0:
             return dequantize_block_sycl<QK5_0, QR5_0, dequantize_q5_0>;
         case GGML_TYPE_Q5_1:
@@ -9244,8 +10688,26 @@ static to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type) {
             return dequantize_row_q5_K_sycl;
         case GGML_TYPE_Q6_K:
             return dequantize_row_q6_K_sycl;
+        case GGML_TYPE_IQ1_S:
+            return dequantize_row_iq1_s_sycl;
+        case GGML_TYPE_IQ1_M:
+            return dequantize_row_iq1_m_sycl;
+        case GGML_TYPE_IQ2_XXS:
+            return dequantize_row_iq2_xxs_sycl;
+        case GGML_TYPE_IQ2_XS:
+            return dequantize_row_iq2_xs_sycl;
+        case GGML_TYPE_IQ2_S:
+            return dequantize_row_iq2_s_sycl;
+        case GGML_TYPE_IQ3_XXS:
+            return dequantize_row_iq3_xxs_sycl;
+        case GGML_TYPE_IQ3_S:
+            return dequantize_row_iq3_s_sycl;
+        case GGML_TYPE_IQ4_XS:
+            return dequantize_row_iq4_xs_sycl;
+        case GGML_TYPE_IQ4_NL:
+            return dequantize_row_iq4_nl_sycl;
         case GGML_TYPE_F16:
-            return dequantize_block_sycl<1, 1, convert_f16>;
+            return convert_unary_sycl<sycl::half>;
         default:
             return nullptr;
     }
@@ -9455,22 +10917,456 @@ static void convert_mul_mat_vec_f16_sycl(const void *vx, const dfloat *y,
     }
 }
 
-template <int qk, int qi, typename block_q_t, int vdr,
-          vec_dot_q_sycl_t vec_dot_q_sycl>
-static void mul_mat_vec_q_sycl_submitter(const void *vx, const void *vy,
+
+static void mul_mat_vec_q4_0_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK4_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK4_0, QI4_0, block_q4_0,
+                                      VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q4_1_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK4_1 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK4_0, QI4_1, block_q4_1,
+                                      VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q5_0_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK5_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK5_0, QI5_0, block_q5_0,
+                                      VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q5_1_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK5_1 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK5_1, QI5_1, block_q5_1,
+                                      VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q8_0_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK8_0 == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK8_0, QI8_0, block_q8_0,
+                                      VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q2_K_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK_K, QI2_K, block_q2_K,
+                                      VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q3_K_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK_K, QI3_K, block_q3_K,
+                                      VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q4_K_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK_K, QI4_K, block_q4_K,
+                                      VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q5_K_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK_K, QI5_K, block_q5_K,
+                                      VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_q6_K_q8_1_sycl(const void *vx, const void *vy,
+                                       float *dst, const int ncols,
+                                       const int nrows,
+                                       dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q<QK_K, QI6_K, block_q6_K,
+                                      VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+
+static void mul_mat_vec_iq2_xxs_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq2_xxs_q8_1<QK_K, QI2_XXS, block_iq2_xxs, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq2_xs_q8_1_sycl(const void *vx, const void *vy,
                                          float *dst, const int ncols,
                                          const int nrows,
                                          dpct::queue_ptr stream) {
-  GGML_ASSERT(ncols % QK4_0 == 0);
-  const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
-  const sycl::range<3> block_nums(1, 1, block_num_y);
-  const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
-  stream->parallel_for(
-      sycl::nd_range<3>(block_nums * block_dims, block_dims), [=
-  ](sycl::nd_item<3> item_ct1) [[intel::reqd_sub_group_size(32)]] {
-        mul_mat_vec_q<qk, qi, block_q_t, vdr, vec_dot_q_sycl>(
-            vx, vy, dst, ncols, nrows, item_ct1);
-      });
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            auto iq2xs_grid_ptr_ct1 = &iq2xs_grid[0];
+            auto ksigns64_ptr_ct1 = &ksigns64[0];
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq2_xs_q8_1<QK_K, QI2_XS, block_iq2_xs, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq2_s_q8_1_sycl(const void *vx, const void *vy,
+                                         float *dst, const int ncols,
+                                         const int nrows,
+                                         dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            auto iq2xs_grid_ptr_ct1 = &iq2xs_grid[0];
+            auto ksigns64_ptr_ct1 = &ksigns64[0];
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq2_s_q8_1<QK_K, QI2_S, block_iq2_s, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq3_xxs_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            auto iq3xxs_grid_ptr_ct1 = &iq3xxs_grid[0];
+            auto ksigns64_ptr_ct1 = &ksigns64[0];
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq3_xxs_q8_1<QK_K, QI3_XXS, block_iq3_xxs, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq3_s_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            auto iq3s_grid_ptr_ct1 = &iq3s_grid[0];
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq3_s_q8_1<QK_K, QI3_XS, block_iq3_s, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq1_s_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            auto iq1s_grid_ptr_ct1 = &iq1s_grid_gpu[0];
+            auto ksigns64_ptr_ct1 = &ksigns64[0];
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq1_s_q8_1<QK_K, QI1_S, block_iq1_s, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq1_m_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq1_m_q8_1<QK_K, QI1_S, block_iq1_m, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq4_nl_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK4_NL == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq4_nl_q8_1<QK4_NL, QI4_NL, block_iq4_nl, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
+}
+
+static void mul_mat_vec_iq4_xs_q8_1_sycl(const void *vx, const void *vy,
+                                          float *dst, const int ncols,
+                                          const int nrows,
+                                          dpct::queue_ptr stream) {
+    GGML_ASSERT(ncols % QK_K == 0);
+    const int block_num_y = (nrows + GGML_SYCL_MMV_Y - 1) / GGML_SYCL_MMV_Y;
+    const sycl::range<3> block_nums(1, 1, block_num_y);
+    const sycl::range<3> block_dims(1, GGML_SYCL_MMV_Y, WARP_SIZE);
+    {
+
+        stream->submit([&](sycl::handler &cgh) {
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1)
+                    [[intel::reqd_sub_group_size(32)]] {
+                        mul_mat_vec_q_iq4_xs_q8_1<QK_K, QI4_XS, block_iq4_xs, 1>(
+                            vx, vy, dst, ncols, nrows, item_ct1);
+                    });
+        });
+    }
 }
 
 static void ggml_mul_mat_q4_0_q8_1_sycl(const void *vx, const void *vy,
@@ -11091,36 +12987,54 @@ static void sum_rows_f32_sycl(const float *x, float *dst, const int ncols,
                              });
 }
 
+static int next_power_of_2(int x) {
+    int n = 1;
+    while (n < x) {
+        n *= 2;
+    }
+    return n;
+}
+
 static void argsort_f32_i32_sycl(const float *x, int *dst, const int ncols,
                                  const int nrows, ggml_sort_order order,
                                  dpct::queue_ptr stream) {
     // bitonic sort requires ncols to be power of 2
-    GGML_ASSERT((ncols & (ncols - 1)) == 0);
+    const int ncols_pad = next_power_of_2(ncols);
 
-    const sycl::range<3> block_dims(1, 1, ncols);
+    const sycl::range<3> block_dims(1, 1, ncols_pad);
     const sycl::range<3> block_nums(1, nrows, 1);
+    const size_t shared_mem = ncols_pad * sizeof(int);
+
+    // GGML_ASSERT(shared_mem <= ggml_cuda_info().devices[ggml_cuda_get_device()].smpb);
+
     if (order == GGML_SORT_ORDER_ASC) {
-        /*
-        DPCT1049:44: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        stream->parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) {
-                k_argsort_f32_i32<GGML_SORT_ORDER_ASC>(x, dst, ncols, item_ct1);
-            });
+        stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                sycl::range<1>(shared_mem), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_argsort_f32_i32<GGML_SORT_ORDER_ASC>(
+                        x, dst, ncols, ncols_pad, item_ct1,
+                        dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
+                            .get());
+                });
+        });
     } else if (order == GGML_SORT_ORDER_DESC) {
-        /*
-        DPCT1049:45: The work-group size passed to the SYCL kernel may exceed
-        the limit. To get the device limit, query
-        info::device::max_work_group_size. Adjust the work-group size if needed.
-        */
-        stream->parallel_for(
-            sycl::nd_range<3>(block_nums * block_dims, block_dims),
-            [=](sycl::nd_item<3> item_ct1) {
-                k_argsort_f32_i32<GGML_SORT_ORDER_DESC>(x, dst, ncols, item_ct1);
-            });
+        stream->submit([&](sycl::handler &cgh) {
+            sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
+                sycl::range<1>(shared_mem), cgh);
+
+            cgh.parallel_for(
+                sycl::nd_range<3>(block_nums * block_dims, block_dims),
+                [=](sycl::nd_item<3> item_ct1) {
+                    k_argsort_f32_i32<GGML_SORT_ORDER_DESC>(
+                        x, dst, ncols, ncols_pad, item_ct1,
+                        dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>()
+                            .get());
+                });
+        });
     } else {
         GGML_ASSERT(false);
     }
@@ -11165,11 +13079,13 @@ static void soft_max_f32_sycl(const float * x, const float * mask, const float *
                               const int nrows_y, const float scale, const float max_bias,
                               dpct::queue_ptr stream) {
     int nth = WARP_SIZE;
-    while (nth < ncols_x && nth < SYCL_SOFT_MAX_BLOCK_SIZE) nth *= 2;
+    int max_block_size = g_work_group_size;
+    while (nth < ncols_x && nth < max_block_size) nth *= 2;
+    if (nth>max_block_size) nth = max_block_size;
+
     const sycl::range<3> block_dims(1, 1, nth);
     const sycl::range<3> block_nums(1, 1, nrows_x);
     const size_t n_local_scratch = (GGML_PAD(ncols_x, WARP_SIZE) + WARP_SIZE);
-    static_assert(SYCL_SOFT_MAX_BLOCK_SIZE == 1024, "These values need to be adjusted.");
 
     const uint32_t n_head_kv   = nrows_x/nrows_y;
     const uint32_t n_head_log2 = 1u << (uint32_t) floorf(log2f((float) n_head_kv));
@@ -11179,6 +13095,12 @@ static void soft_max_f32_sycl(const float * x, const float * mask, const float *
 
     const size_t local_mem_size = stream->get_device().get_info<sycl::info::device::local_mem_size>();
     if (n_local_scratch*sizeof(float) < local_mem_size) {
+        if (ncols_x > max_block_size) {
+            soft_max_f32_submitter<true, 0, 0>(x, mask, pos, dst, ncols_x, nrows_y, scale,
+                                               max_bias, m0, m1, n_head_log2, block_nums,
+                                               block_dims, n_local_scratch, stream);
+            return;
+        }
         switch (ncols_x) {
             case 32:
                 soft_max_f32_submitter<true, 32, 32>(x, mask, pos, dst, ncols_x, nrows_y, scale,
@@ -11451,7 +13373,7 @@ struct sycl_pool_alloc {
         device_id = get_current_device_id();
         device_index = g_sycl_gpu_mgr->get_index(device_id);
         ptr = (T *) ggml_sycl_pool_malloc(device_index, size * sizeof(T), &this->actual_size);
-        // GGML_SYCL_DEBUG("alloc %lu return %p actual size=%lu\n", size * sizeof(T), ptr, this->actual_size);
+        // GGML_SYCL_DEBUG("sycl_pool_alloc %lu return %p actual size=%lu\n", size * sizeof(T), ptr, this->actual_size);
         return ptr;
     }
 
@@ -11482,37 +13404,63 @@ bool ggml_sycl_loaded(void) {
     return g_sycl_loaded;
 }
 
-void print_device_detail(int id) {
+void print_device_detail(int id, sycl::device &device, std::string device_type) {
+
     dpct::device_info prop;
     SYCL_CHECK(CHECK_TRY_ERROR(
-        dpct::get_device_info(prop, dpct::dev_mgr::instance().get_device(id))));
-    sycl::device cur_device = dpct::dev_mgr::instance().get_device(id);
+        dpct::get_device_info(prop, device)));
+
     std::string version;
     version += std::to_string(prop.get_major_version());
     version += ".";
     version += std::to_string(prop.get_minor_version());
 
-    fprintf(stderr, "|%2d|%45s|%18s|%17d|%14d|%13d|%15lu|\n", id,
-            prop.get_name(), version.c_str(), prop.get_max_compute_units(),
+    device_type = std::regex_replace(device_type, std::regex("ext_oneapi_"), "");
+    std::string name = std::string(prop.get_name());
+    name = std::regex_replace(name, std::regex("\\(R\\)"), "");
+    name = std::regex_replace(name, std::regex("\\(TM\\)"), "");
+
+    auto global_mem_size = prop.get_global_mem_size()/1000000;
+
+    fprintf(stderr, "|%2d|%19s|%39s|%7s|%7d|%8d|%5d|%6luM|%21s|\n", id, device_type.c_str(),
+            name.c_str(), version.c_str(), prop.get_max_compute_units(),
             prop.get_max_work_group_size(), prop.get_max_sub_group_size(),
-            prop.get_global_mem_size());
+            global_mem_size, device.get_info<sycl::info::device::driver_version>().c_str());
 }
 
 void ggml_backend_sycl_print_sycl_devices() {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_print_sycl_devices\n");
     int device_count = dpct::dev_mgr::instance().device_count();
+    std::map<std::string, size_t> DeviceNums;
     fprintf(stderr, "found %d SYCL devices:\n", device_count);
-    fprintf(stderr, "|ID| Name                                        |compute capability|Max compute units|Max work group|Max sub group|Global mem size|\n");
-    fprintf(stderr, "|--|---------------------------------------------|------------------|-----------------|--------------|-------------|---------------|\n");
+    fprintf(stderr, "|  |                   |                                       |       |Max    |        |Max  |Global |                     |\n");
+    fprintf(stderr, "|  |                   |                                       |       |compute|Max work|sub  |mem    |                     |\n");
+    fprintf(stderr, "|ID|        Device Type|                                   Name|Version|units  |group   |group|size   |       Driver version|\n");
+    fprintf(stderr, "|--|-------------------|---------------------------------------|-------|-------|--------|-----|-------|---------------------|\n");
     for (int id = 0; id < device_count; ++id) {
-        print_device_detail(id);
+        sycl::device device = dpct::dev_mgr::instance().get_device(id);
+        sycl::backend backend = device.get_backend();
+        std::string backend_type = get_device_backend_and_type(device);
+        int type_id=DeviceNums[backend_type]++;
+        std::stringstream device_type;
+        device_type << "[" <<  backend_type << ":" << std::to_string(type_id) << "]";
+        print_device_detail(id, device, device_type.str());
     }
 }
 
 void print_gpu_device_list() {
-    fprintf(stderr, "detect %d SYCL GPUs: [%s] with Max compute units:%d\n",
-            g_sycl_gpu_mgr->get_gpu_count(),
-            g_sycl_gpu_mgr->gpus_list.c_str(),
-            g_sycl_gpu_mgr->max_compute_units);
+    GGML_ASSERT(g_sycl_gpu_mgr);
+
+    char* hint=NULL;
+    if (g_ggml_sycl_backend_gpu_mode == SYCL_SINGLE_GPU_MODE) {
+        hint = "use %d SYCL GPUs: [%s] with Max compute units:%d\n";
+    } else {
+        hint = "detect %d SYCL GPUs: [%s] with top Max compute units:%d\n";
+    }
+    fprintf(stderr, hint,
+        g_sycl_gpu_mgr->get_gpu_count(),
+        g_sycl_gpu_mgr->gpus_list.c_str(),
+        g_sycl_gpu_mgr->max_compute_units);
 }
 
 int get_sycl_env(const char *env_name, int default_val) {
@@ -11536,11 +13484,13 @@ int get_work_group_size(int user_device_id) {
     return prop.get_max_work_group_size();
 }
 
-void ggml_init_sycl() try {
+static void ggml_init_sycl() try {
     static bool initialized = false;
 
     if (!initialized) {
+        fprintf(stderr, "[SYCL] call ggml_init_sycl\n");
         g_ggml_sycl_debug = get_sycl_env("GGML_SYCL_DEBUG", 0);
+
         fprintf(stderr, "%s: GGML_SYCL_DEBUG: %d\n", __func__, g_ggml_sycl_debug);
 
 #if defined(GGML_SYCL_F16)
@@ -11548,23 +13498,6 @@ void ggml_init_sycl() try {
 #else
         fprintf(stderr, "%s: GGML_SYCL_F16: no\n", __func__);
 #endif
-        if (CHECK_TRY_ERROR(g_all_sycl_device_count =
-                            dpct::dev_mgr::instance().device_count()) != 0) {
-            initialized = true;
-            g_sycl_loaded = false;
-            return;
-        }
-        GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
-        ggml_backend_sycl_print_sycl_devices();
-
-        if (!g_sycl_gpu_mgr) g_sycl_gpu_mgr = new sycl_gpu_mgr();
-
-        g_device_count = g_sycl_gpu_mgr->get_gpu_count();
-        g_work_group_size = g_sycl_gpu_mgr->work_group_size;
-
-        print_gpu_device_list();
-
-        int64_t total_vram = 0;
 
 /* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(SYCL_USE_XMX)
@@ -11573,51 +13506,74 @@ void ggml_init_sycl() try {
         fprintf(stderr, "%s: SYCL_USE_XMX: no\n", __func__);
 #endif
 */
-        for (int id = 0; id < GGML_SYCL_MAX_DEVICES; ++id) {
-            g_device_caps[id].vmm = 0;
-            g_device_caps[id].device_id = -1;
-            g_device_caps[id].cc = 0;
-            g_tensor_split[id] = 0;
-            g_default_tensor_split[id] = 0;
+
+        if (CHECK_TRY_ERROR(g_all_sycl_device_count =
+                            dpct::dev_mgr::instance().device_count()) != 0) {
+            initialized = true;
+            g_sycl_loaded = false;
+            return;
         }
-
-        for (int i = 0; i < g_device_count; ++i) {
-            int device_id = g_sycl_gpu_mgr->gpus[i];
-            g_device_caps[i].vmm = 0;
-
-            dpct::device_info prop;
-            SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
-                prop, dpct::dev_mgr::instance().get_device(device_id))));
-
-            g_default_tensor_split[i] = total_vram;
-            total_vram += prop.get_global_mem_size();
-
-            g_device_caps[i].cc =
-                100 * prop.get_major_version() + 10 * prop.get_minor_version();
-        }
-
-        for (int i = 0; i < g_device_count; ++i) {
-            g_default_tensor_split[i] /= total_vram;
-        }
-
-        for (int i = 0; i < g_device_count; ++i) {
-            SYCL_CHECK(ggml_sycl_set_device(i));
-
-            // create sycl streams
-            for (int is = 0; is < MAX_STREAMS; ++is) {
-                SYCL_CHECK(CHECK_TRY_ERROR(
-                    g_syclStreams[i][is] =
-                        dpct::get_current_device().create_queue(
-                            g_sycl_gpu_mgr->get_co_ctx(), dpct::get_current_device())));
-            }
-
-            const dpct::queue_ptr stream = g_syclStreams[i][0];
-            // create sycl handle
-            SYCL_CHECK(CHECK_TRY_ERROR(g_sycl_handles[i] = stream));
-        }
-
+        GGML_ASSERT(g_all_sycl_device_count <= GGML_SYCL_MAX_DEVICES);
+        ggml_backend_sycl_print_sycl_devices();
         initialized = true;
         g_sycl_loaded = true;
+    }
+}
+catch (sycl::exception const &exc) {
+  std::cerr << exc.what() << "Exception caught at file:" << __FILE__
+            << ", line:" << __LINE__ << std::endl;
+  std::exit(1);
+}
+
+void ggml_init_by_gpus(int device_count) try {
+    g_device_count = device_count;
+    g_work_group_size = g_sycl_gpu_mgr->work_group_size;
+
+    int64_t total_vram = 0;
+
+    print_gpu_device_list();
+
+    for (int id = 0; id < GGML_SYCL_MAX_DEVICES; ++id) {
+        g_device_caps[id].vmm = 0;
+        g_device_caps[id].device_id = -1;
+        g_device_caps[id].cc = 0;
+        g_tensor_split[id] = 0;
+        g_default_tensor_split[id] = 0;
+    }
+
+    for (int i = 0; i < g_device_count; ++i) {
+        int device_id = g_sycl_gpu_mgr->gpus[i];
+        g_device_caps[i].vmm = 0;
+
+        dpct::device_info prop;
+        SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
+            prop, dpct::dev_mgr::instance().get_device(device_id))));
+
+        g_default_tensor_split[i] = total_vram;
+        total_vram += prop.get_global_mem_size();
+
+        g_device_caps[i].cc =
+            100 * prop.get_major_version() + 10 * prop.get_minor_version();
+    }
+
+    for (int i = 0; i < g_device_count; ++i) {
+        g_default_tensor_split[i] /= total_vram;
+    }
+
+    for (int i = 0; i < g_device_count; ++i) {
+        SYCL_CHECK(ggml_sycl_set_device(i));
+
+        // create sycl streams
+        for (int is = 0; is < MAX_STREAMS; ++is) {
+            SYCL_CHECK(CHECK_TRY_ERROR(
+                g_syclStreams[i][is] =
+                    dpct::get_current_device().create_queue(
+                        g_sycl_gpu_mgr->get_co_ctx(), dpct::get_current_device())));
+        }
+
+        const dpct::queue_ptr stream = g_syclStreams[i][0];
+        // create sycl handle
+        SYCL_CHECK(CHECK_TRY_ERROR(g_sycl_handles[i] = stream));
     }
 }
 catch (sycl::exception const &exc) {
@@ -12220,7 +14176,14 @@ static int64_t get_row_rounding(ggml_type type, const std::array<float, GGML_SYC
         case GGML_TYPE_Q5_K:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
         case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+            return max_compute_capability >= VER_GEN9 ? 128 : 64;
+        case GGML_TYPE_IQ3_S:
             return max_compute_capability >= VER_GEN9 ? 128 : 64;
         case GGML_TYPE_Q6_K:
             return 64;
@@ -12237,68 +14200,78 @@ inline void ggml_sycl_op_mul_mat_vec_q(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
 
-    GGML_ASSERT(ggml_nrows(src1) == 1);
+    const int64_t ne10 = src1->ne[0];
+    GGML_ASSERT(ne10 % QK8_1 == 0);
 
     const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
 
-    // TODO: support these quantization types
-    GGML_ASSERT(!(src0->type == GGML_TYPE_IQ2_XXS ||
-                  src0->type == GGML_TYPE_IQ2_XS ||
-                  src0->type == GGML_TYPE_IQ3_XXS ||
-                  src0->type == GGML_TYPE_IQ1_S));
+    int id;
+    SYCL_CHECK(
+        CHECK_TRY_ERROR(id = get_current_device_id()));
+
+    // the main device has a larger memory buffer to hold the results from all GPUs
+    // nrows_dst == nrows of the matrix that the kernel writes into
+    const int64_t nrows_dst = dst->backend == GGML_BACKEND_TYPE_GPU && id == g_main_device ? ne00 : row_diff;
 
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
-          mul_mat_vec_q_sycl_submitter<QK4_0, QI4_0, block_q4_0,
-                                       VDR_Q4_0_Q8_1_MMVQ, vec_dot_q4_0_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q4_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q4_1:
-          mul_mat_vec_q_sycl_submitter<QK4_1, QI4_1, block_q4_1,
-                                       VDR_Q4_1_Q8_1_MMVQ, vec_dot_q4_1_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q4_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q5_0:
-          mul_mat_vec_q_sycl_submitter<QK5_0, QI5_0, block_q5_0,
-                                       VDR_Q5_0_Q8_1_MMVQ, vec_dot_q5_0_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q5_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q5_1:
-          mul_mat_vec_q_sycl_submitter<QK5_1, QI5_1, block_q5_1,
-                                       VDR_Q5_1_Q8_1_MMVQ, vec_dot_q5_1_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q5_1_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q8_0:
-          mul_mat_vec_q_sycl_submitter<QK8_0, QI8_0, block_q8_0,
-                                       VDR_Q8_0_Q8_1_MMVQ, vec_dot_q8_0_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q8_0_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q2_K:
-          mul_mat_vec_q_sycl_submitter<QK_K, QI2_K, block_q2_K,
-                                       VDR_Q2_K_Q8_1_MMVQ, vec_dot_q2_K_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q2_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q3_K:
-          mul_mat_vec_q_sycl_submitter<QK_K, QI3_K, block_q3_K,
-                                       VDR_Q3_K_Q8_1_MMVQ, vec_dot_q3_K_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q3_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q4_K:
-          mul_mat_vec_q_sycl_submitter<QK_K, QI4_K, block_q4_K,
-                                       VDR_Q4_K_Q8_1_MMVQ, vec_dot_q4_K_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q4_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q5_K:
-          mul_mat_vec_q_sycl_submitter<QK_K, QI5_K, block_q5_K,
-                                       VDR_Q5_K_Q8_1_MMVQ, vec_dot_q5_K_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q5_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         case GGML_TYPE_Q6_K:
-          mul_mat_vec_q_sycl_submitter<QK_K, QI6_K, block_q6_K,
-                                       VDR_Q6_K_Q8_1_MMVQ, vec_dot_q6_K_q8_1>(
-              src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
-          break;
+            mul_mat_vec_q6_K_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ1_S:
+            mul_mat_vec_iq1_s_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ1_M:
+            mul_mat_vec_iq1_m_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ2_XXS:
+            mul_mat_vec_iq2_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ2_XS:
+            mul_mat_vec_iq2_xs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ2_S:
+            mul_mat_vec_iq2_s_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ3_XXS:
+            mul_mat_vec_iq3_xxs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ3_S:
+            mul_mat_vec_iq3_s_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ4_NL:
+            mul_mat_vec_iq4_nl_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
+        case GGML_TYPE_IQ4_XS:
+            mul_mat_vec_iq4_xs_q8_1_sycl(src0_dd_i, src1_ddq_i, dst_dd_i, ne00, row_diff, stream);
+            break;
         default:
             GGML_ASSERT(false);
             break;
@@ -12311,6 +14284,7 @@ inline void ggml_sycl_op_mul_mat_vec_q(
     (void) src1_padded_row_size;
 }
 
+
 inline void ggml_sycl_op_dequantize_mul_mat_vec(
     const ggml_tensor *src0, const ggml_tensor *src1, ggml_tensor *dst,
     const char *src0_dd_i, const float *src1_ddf_i, const char *src1_ddq_i,
@@ -12318,9 +14292,10 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
     const int64_t src1_ncols, const int64_t src1_padded_row_size,
     const dpct::queue_ptr &stream) {
 
-    GGML_TENSOR_BINARY_OP_LOCALS;
-
+    const int64_t ne00 = src0->ne[0];
     const int64_t row_diff = row_high - row_low;
+
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
     // on some GPUs it is faster to convert src1 to half and to use half precision intrinsics
 #ifdef GGML_SYCL_F16
@@ -12333,15 +14308,10 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
         src0->type == GGML_TYPE_Q8_0 || src0->type == GGML_TYPE_F16;
 
     if (src1_convert_f16) {
-        if (src1->type == GGML_TYPE_F16) {
-            src1_dfloat = (sycl::half *)src1->data + src1_padded_row_size;
-        } else {
-            src1_dfloat = src1_dfloat_a.alloc(ne00);
-            ggml_cpy_f32_f16_sycl((const char *)src1_ddf_i, (char *)src1_dfloat,
-                                  ne00, ne00, ne01, ne02, nb00, nb01, nb02,
-                                  nb03, ne10, ne11, ne12, nb10, nb11, nb12,
-                                  nb13, stream);
-        }
+        src1_dfloat = src1_dfloat_a.alloc(ne00);
+        const to_fp16_sycl_t to_fp16_sycl = ggml_get_to_fp16_sycl(src1->type);
+        GGML_ASSERT(to_fp16_sycl != nullptr);
+        to_fp16_sycl(src1_ddf_i, src1_dfloat, ne00, stream);
     }
 #else
     const dfloat * src1_dfloat = (const dfloat *) src1_ddf_i; // dfloat == float, no conversion
@@ -12382,6 +14352,7 @@ inline void ggml_sycl_op_dequantize_mul_mat_vec(
             convert_mul_mat_vec_f16_sycl(src0_dd_i, src1_dfloat, dst_dd_i, ne00, row_diff, stream);
             break;
         default:
+            printf("ggml_sycl_op_dequantize_mul_mat_vec unsupported GGML_TYPE %d\n", src0->type);
             GGML_ASSERT(false);
             break;
     }
@@ -12464,7 +14435,7 @@ inline void ggml_sycl_op_mul_mat_sycl(
             src1_ptr, dpct::library_data_t::real_half, ne10, &beta_f16,
             dst_f16.get(), dpct::library_data_t::real_half, ldc,
             dpct::library_data_t::real_half)));
-
+        g_sycl_handles[id]->wait();
         const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(GGML_TYPE_F16);
         to_fp32_sycl(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
     }
@@ -12495,8 +14466,9 @@ inline void ggml_sycl_op_mul_mat_sycl(
             *g_sycl_handles[id], oneapi::mkl::transpose::trans,
             oneapi::mkl::transpose::nontrans, row_diff, src1_ncols, ne10,
             dpct::get_value(&alpha, *g_sycl_handles[id]), src0_ddf_i, ne00,
-            src1_ddf_i, ne10, dpct::get_value(&beta, *g_sycl_handles[id]),
+            src1_ddf1_i, ne10, dpct::get_value(&beta, *g_sycl_handles[id]),
             dst_dd_i, ldc)));
+        g_sycl_handles[id]->wait();
     }
     (void) dst;
     (void) src1_ddq_i;
@@ -12772,7 +14744,12 @@ inline void ggml_sycl_op_soft_max(const ggml_tensor *src0,
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT( dst->type == GGML_TYPE_F32);
 
+    const ggml_tensor * src2 = dst->src[2];
+
+#pragma message("TODO: add ggml_sycl_op_soft_max() F16 src1 and src2 support")
+#pragma message("ref:  https://github.com/ggerganov/llama.cpp/pull/5021")
     GGML_ASSERT(!src1 || src1->type == GGML_TYPE_F32); // src1 contains mask and it is optional
+    GGML_ASSERT(!src2 || src2->type == GGML_TYPE_F32); // src2 contains positions and it is optional
 
     const int64_t ne00 = src0->ne[0];
     const int64_t nrows_x = ggml_nrows(src0);
@@ -12788,7 +14765,6 @@ inline void ggml_sycl_op_soft_max(const ggml_tensor *src0,
     float * src2_dd = nullptr;
     sycl_pool_alloc<float> src2_f;
 
-    ggml_tensor * src2 = dst->src[2];
     const bool use_src2 = src2 != nullptr;
 
     if (use_src2) {
@@ -12923,7 +14899,7 @@ static void ggml_sycl_op_flatten(const ggml_tensor *src0,
     // copy dst to host if necessary
     if (!dst_on_device) {
         SYCL_CHECK(CHECK_TRY_ERROR(
-            main_stream->memcpy(dst->data, dst_ddf, ggml_nbytes(dst))));
+            main_stream->memcpy(dst->data, dst_ddf, ggml_nbytes(dst)).wait()));
     }
 
     if (dst->backend == GGML_BACKEND_TYPE_CPU) {
@@ -13200,7 +15176,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                           SYCL_CHECK(CHECK_TRY_ERROR(stream->memcpy(
                                 src1_ddq_i, src1_ddq_i_source,
                                 src1_ncols * src1_padded_col_size * q8_1_ts /
-                                    q8_1_bs)));
+                                    q8_1_bs).wait()));
                         } else {
 
                             float * src1_ddf_i_source = (float *) src1_extra->data_device[g_main_device];
@@ -13235,8 +15211,8 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                     src1_padded_col_size = (i0 * ne11 + src1_col_0) * ne10;
                 }
                 // do the computation
-                op(src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
-                    dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_col_size, stream);
+                SYCL_CHECK(CHECK_TRY_ERROR(op(src0, src1, dst, src0_dd_i, src1_ddf_i, src1_ddq_i, dst_dd_i,
+                    dev[i].row_low, dev[i].row_high, src1_ncols, src1_padded_col_size, stream)));
                 /*
                 DPCT1010:93: SYCL uses exceptions to report errors and does not
                 use the error codes. The call was replaced with 0. You need to
@@ -13294,7 +15270,7 @@ static void ggml_sycl_op_mul_mat(const ggml_tensor *src0,
                         dhf_dst_i += src1_col_0*ne0;
                         SYCL_CHECK(CHECK_TRY_ERROR(
                             stream->memcpy(dhf_dst_i, dst_dd_i,
-                                           src1_ncols * ne0 * sizeof(float))));
+                                           src1_ncols * ne0 * sizeof(float)).wait()));
                     }
                 }
 
@@ -13605,6 +15581,9 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
     SYCL_CHECK(ggml_sycl_set_device(g_main_device));
     dpct::queue_ptr main_stream = g_syclStreams[g_main_device][0];
 
+    bool no_mixed_dtypes = main_stream->get_backend() == sycl::backend::ext_oneapi_cuda ||
+                           main_stream->get_backend() == sycl::backend::ext_oneapi_hip;
+
     SYCL_CHECK(
         CHECK_TRY_ERROR(g_sycl_handles[g_main_device] = main_stream));
 
@@ -13633,28 +15612,40 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
     sycl_pool_alloc<sycl::half> dst_f16;
     char * dst_t;
 
-    dpct::library_data_t cu_compute_type = dpct::library_data_t::real_half;
-    dpct::library_data_t cu_data_type = dpct::library_data_t::real_half;
+    dpct::library_data_t cu_compute_type = dpct::library_data_t::real_float;
+    dpct::library_data_t cu_data_type = dpct::library_data_t::real_float;
+    if (no_mixed_dtypes) {
+        cu_compute_type = dpct::library_data_t::real_half;
+        cu_data_type = dpct::library_data_t::real_half;
+    }
 
     // dst strides
     size_t nbd2 = dst->nb[2];
     size_t nbd3 = dst->nb[3];
 
+    const float alpha_f32 = 1.0f;
+    const float beta_f32 = 0.0f;
+
     const sycl::half alpha_f16 = 1.0f;
     const sycl::half beta_f16 = 0.0f;
 
-    const float alpha_f32 = 1.0f;
-    const float beta_f32  = 0.0f;
-
-    const void * alpha = &alpha_f16;
-    const void * beta  = &beta_f16;
+    const void * alpha = &alpha_f32;
+    const void * beta  = &beta_f32;
+    if (no_mixed_dtypes) {
+        alpha = &alpha_f16;
+        beta  = &beta_f16;
+    }
 
     // TODO: Renable (dst->op_params[0] =! GGML_PREC_DEFAULT) pathway
-    // once oneMKL open source supports half, half, float, float: datatypes
-    dst_t = (char *) dst_f16.alloc(ne_dst);
+    // when oneMKL open source supports half, half, float, float: datatypes
 
-    nbd2 /= sizeof(float) / sizeof(sycl::half);
-    nbd3 /= sizeof(float) / sizeof(sycl::half);
+    dst_t = (char *) dst_ddf;
+    if (no_mixed_dtypes) {
+        dst_t = (char *) dst_f16.alloc(ne_dst);
+
+        nbd2 /= sizeof(float) / sizeof(sycl::half);
+        nbd3 /= sizeof(float) / sizeof(sycl::half);
+    }
 
     GGML_ASSERT(ne12 % ne02 == 0);
     GGML_ASSERT(ne13 % ne03 == 0);
@@ -13694,6 +15685,7 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
             nb11 / nb10, nb12 / nb10, beta,
             (char *)dst_t, cu_data_type, ne01, nb2 / nb0,
             ne12 * ne13, cu_compute_type)));
+        g_sycl_handles[g_main_device]->wait();
     } else {
         const int ne23 = ne12*ne13;
 
@@ -13724,7 +15716,7 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
                                          nb02, nb03, nb12_scaled, nb13_scaled,
                                          nbd2, nbd3, r2, r3, item_ct1);
                                  });
-            });
+            }).wait();
         }
         SYCL_CHECK(CHECK_TRY_ERROR(dpct::gemm_batch(
             *g_sycl_handles[g_main_device], oneapi::mkl::transpose::trans,
@@ -13735,11 +15727,14 @@ static void ggml_sycl_mul_mat_batched_sycl(const ggml_tensor *src0,
             dpct::library_data_t::real_half, nb11 / nb10, beta,
             (void **)(ptrs_dst.get() + 0 * ne23), cu_data_type, ne01, ne23,
             cu_compute_type)));
+        g_sycl_handles[g_main_device]->wait();
     }
 #endif
 
-    const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(GGML_TYPE_F16);
-    to_fp32_sycl(dst_f16.get(), dst_ddf, ne_dst, main_stream);
+    if (no_mixed_dtypes) {
+        const to_fp32_sycl_t to_fp32_sycl = ggml_get_to_fp32_sycl(GGML_TYPE_F16);
+        to_fp32_sycl(dst_f16.get(), dst_ddf, ne_dst, main_stream);
+    }
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -13798,11 +15793,17 @@ static void ggml_sycl_mul_mat(const ggml_tensor * src0, const ggml_tensor * src1
 #ifdef GGML_SYCL_FORCE_DMMV
             const bool use_mul_mat_vec_q = false;
 #else
-            const bool use_mul_mat_vec_q = min_compute_capability >= VER_4VEC && ggml_is_quantized(src0->type) && ggml_nrows(src1) == 1;
+            bool use_mul_mat_vec_q = min_compute_capability >= VER_4VEC && ggml_is_quantized(src0->type);
+            use_mul_mat_vec_q = use_mul_mat_vec_q ||
+                (src0->type == GGML_TYPE_IQ2_XXS) || (src0->type == GGML_TYPE_IQ2_XS) || (src0->type == GGML_TYPE_IQ2_S) ||
+                (src0->type == GGML_TYPE_IQ3_XXS) || (src0->type == GGML_TYPE_IQ3_S) ||
+                (src0->type == GGML_TYPE_IQ4_NL) || (src0->type == GGML_TYPE_IQ4_XS) ||
+                (src0->type == GGML_TYPE_IQ1_S) || (src0->type == GGML_TYPE_IQ1_M);
+
+
 #endif // GGML_SYCL_FORCE_DMMV
 
             if (use_mul_mat_vec_q) {
-                // NOTE: this kernel does not support ggml_nrows(src1) > 1
                 // GGML_SYCL_DEBUG("ggml_sycl_mul_mat ggml_sycl_op_mul_mat_vec_q path\n");
                 ggml_sycl_op_mul_mat(src0, src1, dst, ggml_sycl_op_mul_mat_vec_q, true);
             } else {
@@ -13852,13 +15853,13 @@ static __global__ void k_compute_batched_ptrs_id(
         src0_f16 = (half *) srcs_ar[i];
     } else {
         src0_f16 = src0_as_f16;
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
+        if (item_ct1.get_local_id(2) == 0 && threadIdx.y == 0) {
             const to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(src0_type);
             to_fp16(srcs_ar[i], src0_f16, src0_ne, syclStreamFireAndForget);
         }
     }
 
-    int i13 = blockIdx.x * blockDim.x + threadIdx.x;
+    int i13 = blockIdx.x * blockDim.x + item_ct1.get_local_id(2);
     int i12 = blockIdx.y * blockDim.y + threadIdx.y;
 
     if (i13 >= ne13 || i12 >= ne12) {
@@ -14005,73 +16006,76 @@ static void ggml_sycl_mul_mat_id_sycl(ggml_tensor * dst) {
 static void ggml_sycl_mul_mat_id(const ggml_tensor *src0,
                                  const ggml_tensor *src1,
                                  ggml_tensor *dst) try {
-#if 0
-    ggml_sycl_mul_mat_id_sycl(dst);
-    // TODO: mmq/mmv support
-#endif
-
-    const int64_t nb11 = src1->nb[1];
-    const int64_t nb1  =  dst->nb[1];
-
-    const struct ggml_tensor * ids = src0;
-    const int32_t id = ((int32_t *) dst->op_params)[0];
-    const int32_t n_as = ((int32_t *) dst->op_params)[1];
-
-    std::vector<char> ids_host(ggml_nbytes(ids));
-
+    GGML_ASSERT(src0->backend != GGML_BACKEND_TYPE_GPU_SPLIT &&
+                "mul_mat_id does not support split buffers");
+    const ggml_tensor *ids = dst->src[2];
     const dpct::queue_ptr stream = g_syclStreams[g_main_device][0];
 
-    if (ids->backend == GGML_BACKEND_TYPE_GPU) {
-        const char * ids_dev = (const char *)((const ggml_tensor_extra_gpu *)ids->extra)->data_device[g_main_device];
-        SYCL_CHECK(CHECK_TRY_ERROR(
-            stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
-        SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
-    } else {
-        memcpy(ids_host.data(), ids->data, ggml_nbytes(ids));
-    }
+    const size_t nb11 = src1->nb[1];
+    const size_t nb1 = dst->nb[1];
 
-    const ggml_tensor_extra_gpu * src1_extra = (const ggml_tensor_extra_gpu *) src1->extra;
-    const ggml_tensor_extra_gpu * dst_extra = (const ggml_tensor_extra_gpu *) dst->extra;
+    const int32_t id = ((int32_t *)dst->op_params)[0];
+    const int32_t n_as = src0->ne[2];
 
+    std::vector<char> ids_host(ggml_nbytes(ids));
+    const char *ids_dev = (const char *)ids->data;
+
+    SYCL_CHECK(CHECK_TRY_ERROR(
+        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
+    SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
+
+    const ggml_tensor_extra_gpu *src0_extra =
+        (const ggml_tensor_extra_gpu *)src0->extra;
+    const ggml_tensor_extra_gpu *src1_extra =
+        (const ggml_tensor_extra_gpu *)src1->extra;
+    const ggml_tensor_extra_gpu *dst_extra =
+        (const ggml_tensor_extra_gpu *)dst->extra;
+
+    ggml_tensor_extra_gpu src0_row_extra;
     ggml_tensor_extra_gpu src1_row_extra;
     ggml_tensor_extra_gpu dst_row_extra;
 
+    ggml_tensor src0_row = *src0;
     ggml_tensor src1_row = *src1;
     ggml_tensor dst_row = *dst;
 
     src1_row.backend = GGML_BACKEND_TYPE_GPU;
     dst_row.backend  = GGML_BACKEND_TYPE_GPU;
 
+    src0_row.extra = &src0_row_extra;
     src1_row.extra = &src1_row_extra;
     dst_row.extra = &dst_row_extra;
 
-    char * src1_original = src1->backend == GGML_BACKEND_TYPE_CPU ?
-        (char *) src1->data : (char *) src1_extra->data_device[g_main_device];
-    char * dst_original  =  dst->backend == GGML_BACKEND_TYPE_CPU ?
-        (char *)  dst->data : (char *)  dst_extra->data_device[g_main_device];
+    char *src0_original = src1->backend == GGML_BACKEND_TYPE_CPU
+                              ? (char *)src0->data
+                              : (char *)src0_extra->data_device[g_main_device];
+    char *src1_original = src1->backend == GGML_BACKEND_TYPE_CPU
+                              ? (char *)src1->data
+                              : (char *)src1_extra->data_device[g_main_device];
+    char *dst_original = dst->backend == GGML_BACKEND_TYPE_CPU
+                             ? (char *)dst->data
+                             : (char *)dst_extra->data_device[g_main_device];
+
+    src0_row.ne[2] = 1;
+    src0_row.ne[3] = 1;
+    src0_row.nb[3] = src0->nb[2];
 
     if (src1->ne[1] == 1) {
-        GGML_ASSERT(src1->backend == GGML_BACKEND_TYPE_GPU);
-        GGML_ASSERT(dst->backend  == GGML_BACKEND_TYPE_GPU);
-
         for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
-            //int32_t row_id;
-            //SYCL_CHECK(syclMemcpyAsync(&row_id, ids_dev + i01*ids->nb[1] + id*ids->nb[0], sizeof(int32_t), syclMemcpyDeviceToHost, g_syclStreams[g_main_device][0]));
-            //SYCL_CHECK(syclStreamSynchronize(g_syclStreams[g_main_device][0]));
-
-            const int32_t row_id = *(const int32_t *) (ids_host.data() + i01*ids->nb[1] + id*ids->nb[0]);
+            const int32_t row_id =
+                *(const int32_t *)(ids_host.data() + i01 * ids->nb[1] +
+                                   id * ids->nb[0]);
 
             GGML_ASSERT(row_id >= 0 && row_id < n_as);
 
-            const struct ggml_tensor * src0_row = dst->src[row_id + 2];
+            src0_row_extra.data_device[g_main_device] =
+                src0_original + row_id * src0->nb[2];
+            src1_row_extra.data_device[g_main_device] =
+                src1_original + i01 * src1->nb[1];
+            dst_row_extra.data_device[g_main_device] =
+                dst_original + i01 * dst->nb[1];
 
-            src1_row_extra.data_device[g_main_device] = src1_original + i01*src1->nb[1];
-            src1_row.data = (char *) src1->data + i01*src1->nb[1]; // TODO why is this set?
-
-            dst_row_extra.data_device[g_main_device] = dst_original + i01*dst->nb[1];
-            dst_row.data = (char *) dst->data + i01*dst->nb[1]; // TODO why is this set?
-
-            ggml_sycl_mul_mat(src0_row, &src1_row, &dst_row);
+            ggml_sycl_mul_mat(&src0_row, &src1_row, &dst_row);
         }
     } else {
         sycl_pool_alloc<char> src1_contiguous(sizeof(float)*ggml_nelements(src1));
@@ -14081,8 +16085,6 @@ static void ggml_sycl_mul_mat_id(const ggml_tensor *src0,
         dst_row_extra.data_device[g_main_device]  =  dst_contiguous.get();
 
         for (int32_t row_id = 0; row_id < n_as; ++row_id) {
-            const struct ggml_tensor * src0_row = dst->src[row_id + 2];
-
             int64_t num_src1_rows = 0;
             for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + i01*ids->nb[1] + id*ids->nb[0]);
@@ -14103,6 +16105,9 @@ static void ggml_sycl_mul_mat_id(const ggml_tensor *src0,
                 continue;
             }
 
+            src0_row_extra.data_device[g_main_device] =
+                src0_original + row_id * src0->nb[2];
+
             src1_row.ne[1] = num_src1_rows;
             dst_row.ne[1] = num_src1_rows;
 
@@ -14114,7 +16119,7 @@ static void ggml_sycl_mul_mat_id(const ggml_tensor *src0,
             dst_row.nb[2] = num_src1_rows*nb1;
             dst_row.nb[3] = num_src1_rows*nb1;
 
-            ggml_sycl_mul_mat(src0_row, &src1_row, &dst_row);
+            ggml_sycl_mul_mat(&src0_row, &src1_row, &dst_row);
 
             num_src1_rows = 0;
             for (int64_t i01 = 0; i01 < ids->ne[1]; i01++) {
@@ -14639,6 +16644,7 @@ bool ggml_sycl_compute_forward(struct ggml_compute_params * params, struct ggml_
 }
 
 GGML_API GGML_CALL void   ggml_sycl_get_gpu_list(int *id_list, int max_len) try {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_get_gpu_list\n");
     for(int i=0;i<max_len;i++) id_list[i] = -1;
 
     if (!g_sycl_gpu_mgr) {
@@ -14673,6 +16679,7 @@ catch (sycl::exception const &exc) {
 
 GGML_API GGML_CALL void ggml_sycl_get_device_description(int device, char *description,
                                       size_t description_size) try {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_sycl_get_device_description\n");
     dpct::device_info prop;
     int device_id = g_sycl_gpu_mgr->gpus[device];
     SYCL_CHECK(CHECK_TRY_ERROR(dpct::get_device_info(
@@ -14687,6 +16694,7 @@ catch (sycl::exception const &exc) {
 
 GGML_CALL void ggml_backend_sycl_get_device_memory(int device, size_t *free,
                                                    size_t *total) try {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_memory\n");
     ggml_sycl_set_device(device);
 
     /*
@@ -14827,11 +16835,13 @@ static void ggml_backend_sycl_buffer_set_tensor(ggml_backend_buffer_t buffer,
     const dpct::queue_ptr stream = g_syclStreams[ctx->device][0];
     SYCL_CHECK(
         CHECK_TRY_ERROR(dpct::dev_mgr::instance().get_device(ctx->device).queues_wait_and_throw()));
-
+    char* host_buf = (char*)malloc(size);
+    memcpy(host_buf, data, size);
     SYCL_CHECK(
         CHECK_TRY_ERROR((*stream)
-                             .memcpy((char *)tensor->data + offset, data, size)
+                             .memcpy((char *)tensor->data + offset, host_buf, size)
                              .wait()));
+    free(host_buf);
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -15037,22 +17047,26 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_buffer_type_interface = {
     /* .is_host          = */ nullptr,
 };
 
-ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device) {
+ggml_backend_buffer_type_t ggml_backend_sycl_buffer_type(int device_index) {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_buffer_type\n");
+
+    if (device_index>=g_device_count or device_index<0) {
+        printf("ggml_backend_sycl_buffer_type error: device_index:%d is out of range [0, %d], miss to call ggml_backend_sycl_set_single_device()\n",
+            device_index, g_device_count-1);
+        GGML_ASSERT(device_index<g_device_count);
+    }
     static struct ggml_backend_buffer_type ggml_backend_sycl_buffer_types[GGML_SYCL_MAX_DEVICES];
 
-    static bool ggml_backend_sycl_buffer_type_initialized = false;
-
-    if (!ggml_backend_sycl_buffer_type_initialized) {
+    if (!g_ggml_backend_sycl_buffer_type_initialized) {
         for (int i = 0; i < g_device_count; i++) {
             ggml_backend_sycl_buffer_types[i] = {
                 /* .iface    = */ ggml_backend_sycl_buffer_type_interface,
                 /* .context  = */ new ggml_backend_sycl_buffer_type_context{i, GGML_SYCL_NAME + std::to_string(g_sycl_gpu_mgr->gpus[i])},
             };
         }
-        ggml_backend_sycl_buffer_type_initialized = true;
+        g_ggml_backend_sycl_buffer_type_initialized = true;
     }
-
-    return &ggml_backend_sycl_buffer_types[device];
+    return &ggml_backend_sycl_buffer_types[device_index];
 }
 
 // sycl split buffer type
@@ -15405,6 +17419,8 @@ static ggml_backend_buffer_type_i ggml_backend_sycl_split_buffer_type_interface 
 };
 
 GGML_CALL ggml_backend_buffer_type_t ggml_backend_sycl_split_buffer_type(const float * tensor_split) {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_split_buffer_type\n");
+    ggml_init_sycl();
     // FIXME: this is not thread safe
     static std::map<std::array<float, GGML_SYCL_MAX_DEVICES>, struct ggml_backend_buffer_type> buft_map;
 
@@ -15476,6 +17492,7 @@ static ggml_backend_buffer_t ggml_backend_sycl_host_buffer_type_alloc_buffer(ggm
 }
 
 ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_host_buffer_type\n");
     static struct ggml_backend_buffer_type ggml_backend_sycl_buffer_type_host = {
         /* .iface    = */ {
             /* .get_name         = */ ggml_backend_sycl_host_buffer_type_name,
@@ -15522,7 +17539,7 @@ GGML_CALL static void ggml_backend_sycl_set_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(tensor->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(tensor->backend == GGML_BACKEND_TYPE_GPU);
     SYCL_CHECK(CHECK_TRY_ERROR(g_syclStreams[sycl_ctx->device][0]->memcpy(
-        (char *)tensor->data + offset, data, size)));
+        (char *)tensor->data + offset, data, size).wait()));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -15538,7 +17555,7 @@ GGML_CALL static void ggml_backend_sycl_get_tensor_async(ggml_backend_t backend,
     GGML_ASSERT(tensor->buffer->buft == ggml_backend_sycl_buffer_type(sycl_ctx->device) && "unsupported buffer type");
     GGML_ASSERT(tensor->backend == GGML_BACKEND_TYPE_GPU);
     SYCL_CHECK(CHECK_TRY_ERROR(g_syclStreams[sycl_ctx->device][0]->memcpy(
-        data, (const char *)tensor->data + offset, size)));
+        data, (const char *)tensor->data + offset, size).wait()));
 }
 catch (sycl::exception const &exc) {
   std::cerr << exc.what() << "Exception caught at file:" << __FILE__
@@ -15557,7 +17574,7 @@ GGML_CALL static bool ggml_backend_sycl_cpy_tensor_async(ggml_backend_t backend,
         was inserted. You need to rewrite this code.
         */
         SYCL_CHECK(CHECK_TRY_ERROR(g_syclStreams[sycl_ctx->device][0]->memcpy(
-            dst->data, src->data, ggml_nbytes(dst))));
+            dst->data, src->data, ggml_nbytes(dst)).wait()));
         return true;
     }
 
@@ -15581,7 +17598,7 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-GGML_CALL static bool ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+GGML_CALL static ggml_status ggml_backend_sycl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_sycl_context * sycl_ctx = (ggml_backend_sycl_context *)backend->context;
     ggml_sycl_set_main_device(sycl_ctx->device);
 
@@ -15590,7 +17607,7 @@ GGML_CALL static bool ggml_backend_sycl_graph_compute(ggml_backend_t backend, gg
     params.ith = 0;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
-        if (node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
+        if (ggml_is_empty(node) || node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_NONE) {
             continue;
         }
 #ifndef NDEBUG
@@ -15613,7 +17630,7 @@ GGML_CALL static bool ggml_backend_sycl_graph_compute(ggml_backend_t backend, gg
         GGML_ASSERT(ok);
     }
 
-    return true;
+    return GGML_STATUS_SUCCESS;
 }
 
 GGML_CALL static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, const ggml_tensor * op) {
@@ -15647,20 +17664,16 @@ GGML_CALL static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, cons
                 if (a->ne[3] != b->ne[3]) {
                     return false;
                 }
-
-                if (a->type == GGML_TYPE_IQ1_S) {
-                    return false;
+                ggml_type a_type = a->type;
+                if (a_type == GGML_TYPE_IQ4_NL  || a_type == GGML_TYPE_IQ4_XS ||
+                    a_type == GGML_TYPE_IQ3_XXS || a_type == GGML_TYPE_IQ3_S  ||
+                    a_type == GGML_TYPE_IQ2_XXS || a_type == GGML_TYPE_IQ2_XS || a_type == GGML_TYPE_IQ2_S ||
+                    a_type == GGML_TYPE_IQ1_S || a_type == GGML_TYPE_IQ1_M
+                    ) {
+                    if (b->ne[1] == 1 && ggml_nrows(b) > 1) {
+                        return false;
+                    }
                 }
-                if (a->type == GGML_TYPE_IQ3_XXS) {
-                  return false;
-                }
-                if (a->type == GGML_TYPE_IQ2_XXS) {
-                    return false;
-                }
-                if (a->type == GGML_TYPE_IQ2_XS) {
-                    return false;
-                }
-
                 return true;
             } break;
         case GGML_OP_GET_ROWS:
@@ -15705,15 +17718,15 @@ GGML_CALL static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, cons
                 }
                 return false;
             } break;
-        case GGML_OP_DUP:
-        case GGML_OP_REPEAT:
         case GGML_OP_CONCAT:
             {
                 ggml_type src0_type = op->src[0]->type;
                 return src0_type != GGML_TYPE_I32 && src0_type != GGML_TYPE_I16;
             } break;
+        case GGML_OP_DUP:
         case GGML_OP_NONE:
         case GGML_OP_RESHAPE:
+        case GGML_OP_REPEAT:
         case GGML_OP_VIEW:
         case GGML_OP_PERMUTE:
         case GGML_OP_TRANSPOSE:
@@ -15747,19 +17760,32 @@ GGML_CALL static bool ggml_backend_sycl_supports_op(ggml_backend_t backend, cons
     UNUSED(backend);
 }
 
+GGML_CALL static bool ggml_backend_sycl_offload_op(ggml_backend_t backend, const ggml_tensor * op) {
+    const int min_batch_size = 32;
+    return op->ne[1] >= min_batch_size && op->op != GGML_OP_GET_ROWS && op->op != GGML_OP_MUL_MAT_ID;
+    GGML_UNUSED(backend);
+}
+
+
 static ggml_backend_i ggml_backend_sycl_interface = {
     /* .get_name                = */ ggml_backend_sycl_name,
     /* .free                    = */ ggml_backend_sycl_free,
     /* .get_default_buffer_type = */ ggml_backend_sycl_get_default_buffer_type,
     /* .set_tensor_async        = */ ggml_backend_sycl_set_tensor_async,
     /* .get_tensor_async        = */ ggml_backend_sycl_get_tensor_async,
-    /* .cpy_tensor_async        = */ ggml_backend_sycl_cpy_tensor_async,
+    /* .cpy_tensor_async        = */ NULL, //ggml_backend_sycl_cpy_tensor_async, // TODO: update for the new interface
     /* .synchronize             = */ ggml_backend_sycl_synchronize,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_compute      = */ NULL,
     /* .graph_compute           = */ ggml_backend_sycl_graph_compute,
     /* .supports_op             = */ ggml_backend_sycl_supports_op,
+    /* .offload_op              = */ ggml_backend_sycl_offload_op,
+    /* .event_new               = */ NULL,
+    /* .event_free              = */ NULL,
+    /* .event_record            = */ NULL,
+    /* .event_wait              = */ NULL,
+    /* .event_synchronize       = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_sycl_guid() {
@@ -15768,7 +17794,8 @@ static ggml_guid_t ggml_backend_sycl_guid() {
 }
 
 GGML_CALL ggml_backend_t ggml_backend_sycl_init(int device) {
-    ggml_init_sycl(); // TODO: remove from ggml.c
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_init\n");
+    ggml_init_sycl();
 
     check_allow_gpu_index(device);
 
@@ -15794,6 +17821,7 @@ bool ggml_backend_is_sycl(ggml_backend_t backend) {
 }
 
 GGML_CALL int ggml_backend_sycl_get_device_count() {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_count\n");
     if (!g_sycl_gpu_mgr) g_sycl_gpu_mgr = new sycl_gpu_mgr();
     return g_sycl_gpu_mgr->get_gpu_count();
 }
@@ -15806,14 +17834,53 @@ GGML_CALL static ggml_backend_t ggml_backend_reg_sycl_init(const char * params, 
 }
 
 GGML_API GGML_CALL int ggml_backend_sycl_get_device_index(int device_id) {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_index\n");
     return g_sycl_gpu_mgr->get_index(device_id);
+}
+
+GGML_API GGML_CALL int ggml_backend_sycl_get_device_id(int device_index) {
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_get_device_id\n");
+    return g_sycl_gpu_mgr->gpus[device_index];
+}
+
+GGML_API GGML_CALL void ggml_backend_sycl_set_single_device_mode(int main_gpu_id) {
+    ggml_init_sycl();
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_set_single_device_mode\n");
+    fprintf(stderr, "ggml_backend_sycl_set_single_device: use single device: [%d]\n", main_gpu_id);
+    GGML_ASSERT(main_gpu_id<g_all_sycl_device_count);
+
+    if (g_sycl_gpu_mgr) {
+        delete g_sycl_gpu_mgr;
+    }
+    g_sycl_gpu_mgr = new sycl_gpu_mgr(main_gpu_id);
+    g_ggml_sycl_backend_gpu_mode = SYCL_SINGLE_GPU_MODE;
+    ggml_init_by_gpus(g_sycl_gpu_mgr->get_gpu_count());
+    g_ggml_backend_sycl_buffer_type_initialized = false;
+}
+
+GGML_API GGML_CALL void ggml_backend_sycl_set_mul_device_mode() {
+    ggml_init_sycl();
+    GGML_SYCL_DEBUG("[SYCL] call ggml_backend_sycl_set_mul_device_mode\n");
+
+    if (g_ggml_sycl_backend_gpu_mode == SYCL_MUL_GPU_MODE) {
+        return;
+    }
+
+    fprintf(stderr, "ggml_backend_sycl_set_mul_device_mode: true\n");
+
+    if (g_sycl_gpu_mgr) {
+        delete g_sycl_gpu_mgr;
+    }
+    g_sycl_gpu_mgr = new sycl_gpu_mgr();
+    g_ggml_sycl_backend_gpu_mode = SYCL_MUL_GPU_MODE;
+    ggml_init_by_gpus(g_sycl_gpu_mgr->get_gpu_count());
+    g_ggml_backend_sycl_buffer_type_initialized = false;
 }
 
 extern "C" int ggml_backend_sycl_reg_devices();
 
 int ggml_backend_sycl_reg_devices() {
-    if (!g_sycl_gpu_mgr) g_sycl_gpu_mgr = new sycl_gpu_mgr();
-    g_device_count = g_sycl_gpu_mgr->get_gpu_count();
+    ggml_backend_sycl_set_mul_device_mode();
     assert(g_device_count>0);
     for (int i = 0; i < g_device_count; i++) {
         int id = g_sycl_gpu_mgr->gpus[i];
