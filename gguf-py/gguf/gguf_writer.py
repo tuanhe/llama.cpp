@@ -7,7 +7,7 @@ import struct
 import tempfile
 from enum import Enum, auto
 from io import BufferedWriter
-from typing import IO, Any, Callable, Sequence, Mapping
+from typing import IO, Any, Sequence, Mapping
 from string import ascii_letters, digits
 
 import numpy as np
@@ -25,48 +25,9 @@ from .constants import (
     TokenType,
 )
 
+from .quants import quant_shape_from_byte_shape
+
 logger = logging.getLogger(__name__)
-
-
-class LazyTensor:
-    data: Callable[[], np.ndarray[Any, Any]]
-    # to avoid too deep recursion
-    functions: list[Callable[[np.ndarray[Any, Any]], np.ndarray[Any, Any]]]
-    dtype: np.dtype[Any]
-    shape: tuple[int, ...]
-
-    def __init__(self, data: Callable[[], np.ndarray[Any, Any]], *, dtype: type, shape: tuple[int, ...]):
-        self.data = data
-        self.functions = []
-        self.dtype = np.dtype(dtype)
-        self.shape = shape
-
-    def astype(self, dtype: type, **kwargs) -> LazyTensor:
-        self.functions.append(lambda n: n.astype(dtype, **kwargs))
-        self.dtype = np.dtype(dtype)
-        return self
-
-    @property
-    def nbytes(self) -> int:
-        size = 1
-        for n in self.shape:
-            size *= n
-        return size * self.dtype.itemsize
-
-    def tofile(self, *args, **kwargs) -> None:
-        data = self.data()
-        for f in self.functions:
-            data = f(data)
-        assert data.shape == self.shape
-        assert data.dtype == self.dtype
-        assert data.nbytes == self.nbytes
-        self.functions = []
-        self.data = lambda: data
-        data.tofile(*args, **kwargs)
-
-    def byteswap(self, *args, **kwargs) -> LazyTensor:
-        self.functions.append(lambda n: n.byteswap(*args, **kwargs))
-        return self
 
 
 class WriterState(Enum):
@@ -79,7 +40,7 @@ class WriterState(Enum):
 class GGUFWriter:
     fout: BufferedWriter
     temp_file: tempfile.SpooledTemporaryFile[bytes] | None
-    tensors: list[np.ndarray[Any, Any] | LazyTensor]
+    tensors: list[np.ndarray[Any, Any]]
     _simple_value_packing = {
         GGUFValueType.UINT8:   "B",
         GGUFValueType.INT8:    "b",
@@ -236,7 +197,7 @@ class GGUFWriter:
         return ((x + n - 1) // n) * n
 
     def add_tensor_info(
-        self, name: str, tensor_shape: Sequence[int], tensor_dtype: np.dtype[np.float16] | np.dtype[np.float32],
+        self, name: str, tensor_shape: Sequence[int], tensor_dtype: np.dtype,
         tensor_nbytes: int, raw_dtype: GGMLQuantizationType | None = None,
     ) -> None:
         if self.state is not WriterState.EMPTY:
@@ -249,10 +210,6 @@ class GGUFWriter:
         encoded_name = name.encode("utf-8")
         self.ti_data += self._pack("Q", len(encoded_name))
         self.ti_data += encoded_name
-        n_dims = len(tensor_shape)
-        self.ti_data += self._pack("I", n_dims)
-        for i in range(n_dims):
-            self.ti_data += self._pack("Q", tensor_shape[n_dims - 1 - i])
         if raw_dtype is None:
             if tensor_dtype == np.float16:
                 dtype = GGMLQuantizationType.F16
@@ -272,13 +229,19 @@ class GGUFWriter:
                 raise ValueError("Only F16, F32, F64, I8, I16, I32, I64 tensors are supported for now")
         else:
             dtype = raw_dtype
+            if tensor_dtype == np.uint8:
+                tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
+        n_dims = len(tensor_shape)
+        self.ti_data += self._pack("I", n_dims)
+        for i in range(n_dims):
+            self.ti_data += self._pack("Q", tensor_shape[n_dims - 1 - i])
         self.ti_data += self._pack("I", dtype)
         self.ti_data += self._pack("Q", self.offset_tensor)
         self.offset_tensor += GGUFWriter.ggml_pad(tensor_nbytes, self.data_alignment)
         self.ti_data_count += 1
 
     def add_tensor(
-        self, name: str, tensor: np.ndarray[Any, Any] | LazyTensor, raw_shape: Sequence[int] | None = None,
+        self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
         raw_dtype: GGMLQuantizationType | None = None,
     ) -> None:
         if self.endianess == GGUFEndian.BIG:
@@ -303,7 +266,7 @@ class GGUFWriter:
         if pad != 0:
             fp.write(bytes([0] * pad))
 
-    def write_tensor_data(self, tensor: np.ndarray[Any, Any] | LazyTensor) -> None:
+    def write_tensor_data(self, tensor: np.ndarray[Any, Any]) -> None:
         if self.state is not WriterState.TI_DATA:
             raise ValueError(f'Expected output file to contain tensor info, got {self.state}')
 
@@ -391,7 +354,7 @@ class GGUFWriter:
     def add_name(self, name: str) -> None:
         self.add_string(Keys.General.NAME, name)
 
-    def add_quantization_version(self, quantization_version: GGMLQuantizationType) -> None:
+    def add_quantization_version(self, quantization_version: int) -> None:
         self.add_uint32(
             Keys.General.QUANTIZATION_VERSION, quantization_version)
 
@@ -467,6 +430,9 @@ class GGUFWriter:
 
     def add_rope_scaling_factor(self, value: float) -> None:
         self.add_float32(Keys.Rope.SCALING_FACTOR.format(arch=self.arch), value)
+
+    def add_rope_scaling_attn_factors(self, value: Sequence[float]) -> None:
+        self.add_float32(Keys.Rope.SCALING_ATTN_FACTOR.format(arch=self.arch), value)
 
     def add_rope_scaling_orig_ctx_len(self, value: int) -> None:
         self.add_uint32(Keys.Rope.SCALING_ORIG_CTX_LEN.format(arch=self.arch), value)
