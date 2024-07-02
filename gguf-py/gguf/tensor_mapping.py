@@ -24,6 +24,7 @@ class TensorNameMap:
             "backbone.embedding",                        # mamba
             "backbone.embeddings",                       # mamba-hf
             "transformer.in_out_embed",                  # Grok
+            "shared",                                    # t5
         ),
 
         # Token type embeddings
@@ -102,6 +103,7 @@ class TensorNameMap:
         # Attention norm 2
         MODEL_TENSOR.ATTN_NORM_2: (
             "transformer.h.{bid}.ln_attn",  # falcon40b
+            "encoder.layer.{bid}.layer_norm_1",             # jina-v2-code
         ),
 
         # Attention query-key-value
@@ -185,6 +187,10 @@ class TensorNameMap:
             "transformer.blocks.{bid}.norm_attn_norm.norm_2",  # dbrx
         ),
 
+        MODEL_TENSOR.ATTN_POST_NORM: (
+            "model.layers.{bid}.post_attention_layernorm",     # gemma2
+        ),
+
         # Rotary embeddings
         MODEL_TENSOR.ATTN_ROT_EMBD: (
             "model.layers.{bid}.self_attn.rotary_emb.inv_freq",        # llama-hf
@@ -206,6 +212,16 @@ class TensorNameMap:
             "h.{bid}.ln_2",                                                  # gpt2
             "model.layers.{bid}.ffn_norm",                                   # internlm2
             "transformer.decoder_layer.{bid}.rms_norm_2",                    # Grok
+        ),
+
+        # Post feed-forward norm
+        MODEL_TENSOR.FFN_PRE_NORM: (
+            "model.layers.{bid}.pre_feedforward_layernorm", # gemma2
+        ),
+
+        # Post feed-forward norm
+        MODEL_TENSOR.FFN_POST_NORM: (
+            "model.layers.{bid}.post_feedforward_layernorm", # gemma2
         ),
 
         MODEL_TENSOR.FFN_GATE_INP: (
@@ -256,6 +272,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_UP_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.up_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_experts.up_proj", # deepseek2
         ),
 
         # AWQ-activation gate
@@ -285,6 +302,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_GATE_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.gate_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_experts.gate_proj", # deepseek2
         ),
 
         # Feed-forward down
@@ -309,6 +327,7 @@ class TensorNameMap:
             "model.layers.{bid}.mlp.c_proj",                          # starcoder2
             "encoder.layer.{bid}.mlp.wo",                             # jina-bert-v2
             "model.layers.{bid}.residual_mlp.w2",                     # arctic
+            "encoder.layer.{bid}.mlp.down_layer",                     # jina-bert-v2
         ),
 
         MODEL_TENSOR.FFN_DOWN_EXP: (
@@ -320,6 +339,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.FFN_DOWN_SHEXP: (
             "model.layers.{bid}.mlp.shared_expert.down_proj",  # qwen2moe
+            "model.layers.{bid}.mlp.shared_experts.down_proj", # deepseek2
         ),
 
         MODEL_TENSOR.ATTN_Q_NORM: (
@@ -347,6 +367,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.norm2",                   # nomic-bert
             "transformer.decoder_layer.{bid}.rms_norm_3",   # Grok
             "encoder.layer.{bid}.mlp.layernorm",            # jina-bert-v2
+            "encoder.layer.{bid}.layer_norm_2"              # jina-v2-code
         ),
 
         MODEL_TENSOR.SSM_IN: (
@@ -383,6 +404,152 @@ class TensorNameMap:
             "model.layers.{bid}.out_proj",
             "backbone.layers.{bid}.mixer.out_proj",
         ),
+
+        MODEL_TENSOR.ATTN_Q_A: (
+            "model.layers.{bid}.self_attn.q_a_proj", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_Q_B: (
+            "model.layers.{bid}.self_attn.q_b_proj", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_KV_A_MQA: (
+            "model.layers.{bid}.self_attn.kv_a_proj_with_mqa", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_KV_B: (
+            "model.layers.{bid}.self_attn.kv_b_proj", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_Q_A_NORM: (
+            "model.layers.{bid}.self_attn.q_a_layernorm", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_KV_A_NORM: (
+            "model.layers.{bid}.self_attn.kv_a_layernorm", # deepseek2
+        ),
+
+        MODEL_TENSOR.ATTN_SUB_NORM: (
+            "model.layers.{bid}.self_attn.inner_attn_ln",  # bitnet
+        ),
+
+        MODEL_TENSOR.FFN_SUB_NORM: (
+            "model.layers.{bid}.mlp.ffn_layernorm",  # bitnet
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_NORM: (
+            "decoder.block.{bid}.layer.0.layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_Q: (
+            "decoder.block.{bid}.layer.0.SelfAttention.q", # t5
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_K: (
+            "decoder.block.{bid}.layer.0.SelfAttention.k", # t5
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_V: (
+            "decoder.block.{bid}.layer.0.SelfAttention.v", # t5
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_OUT: (
+            "decoder.block.{bid}.layer.0.SelfAttention.o", # t5
+        ),
+
+        MODEL_TENSOR.DEC_ATTN_REL_B: (
+            "decoder.block.{bid}.layer.0.SelfAttention.relative_attention_bias", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_NORM: (
+            "decoder.block.{bid}.layer.1.layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_Q: (
+            "decoder.block.{bid}.layer.1.EncDecAttention.q", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_K: (
+            "decoder.block.{bid}.layer.1.EncDecAttention.k", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_V: (
+            "decoder.block.{bid}.layer.1.EncDecAttention.v", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_OUT: (
+            "decoder.block.{bid}.layer.1.EncDecAttention.o", # t5
+        ),
+
+        MODEL_TENSOR.DEC_CROSS_ATTN_REL_B: (
+            "decoder.block.{bid}.layer.1.EncDecAttention.relative_attention_bias", # t5
+        ),
+
+        MODEL_TENSOR.DEC_FFN_NORM: (
+            "decoder.block.{bid}.layer.2.layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.DEC_FFN_GATE: (
+            "decoder.block.{bid}.layer.2.DenseReluDense.wi_0", # flan-t5
+        ),
+
+        MODEL_TENSOR.DEC_FFN_UP: (
+            "decoder.block.{bid}.layer.2.DenseReluDense.wi",   # t5
+            "decoder.block.{bid}.layer.2.DenseReluDense.wi_1", # flan-t5
+        ),
+
+        MODEL_TENSOR.DEC_FFN_DOWN: (
+            "decoder.block.{bid}.layer.2.DenseReluDense.wo", # t5
+        ),
+
+        MODEL_TENSOR.DEC_OUTPUT_NORM: (
+            "decoder.final_layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_NORM: (
+            "encoder.block.{bid}.layer.0.layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_Q: (
+            "encoder.block.{bid}.layer.0.SelfAttention.q", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_K: (
+            "encoder.block.{bid}.layer.0.SelfAttention.k", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_V: (
+            "encoder.block.{bid}.layer.0.SelfAttention.v", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_OUT: (
+            "encoder.block.{bid}.layer.0.SelfAttention.o", # t5
+        ),
+
+        MODEL_TENSOR.ENC_ATTN_REL_B: (
+            "encoder.block.{bid}.layer.0.SelfAttention.relative_attention_bias", # t5
+        ),
+
+        MODEL_TENSOR.ENC_FFN_NORM: (
+            "encoder.block.{bid}.layer.1.layer_norm", # t5
+        ),
+
+        MODEL_TENSOR.ENC_FFN_GATE: (
+            "encoder.block.{bid}.layer.1.DenseReluDense.wi_0", # flan-t5
+        ),
+
+        MODEL_TENSOR.ENC_FFN_UP: (
+            "encoder.block.{bid}.layer.1.DenseReluDense.wi",   # t5
+            "encoder.block.{bid}.layer.1.DenseReluDense.wi_1", # flan-t5
+        ),
+
+        MODEL_TENSOR.ENC_FFN_DOWN: (
+            "encoder.block.{bid}.layer.1.DenseReluDense.wo", # t5
+        ),
+
+        MODEL_TENSOR.ENC_OUTPUT_NORM: (
+            "encoder.final_layer_norm", # t5
+        ),
     }
 
     # architecture-specific block mappings
@@ -415,7 +582,7 @@ class TensorNameMap:
                 if tensor not in MODEL_TENSORS[arch]:
                     continue
                 # TODO: make this configurable
-                n_experts = 128
+                n_experts = 160
                 for xid in range(n_experts):
                     tensor_name = TENSOR_NAMES[tensor].format(bid = bid, xid = xid)
                     self.mapping[tensor_name] = (tensor, tensor_name)
